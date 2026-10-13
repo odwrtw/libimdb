@@ -20,7 +20,7 @@ var headers = map[Dataset]string{
 	Ratings: "tconst\taverageRating\tnumVotes",
 }
 
-func parseGzip(ctx context.Context, d Dataset, input io.Reader, w *datasetWriter, progress func(Progress)) (int64, error) {
+func parseGzip(ctx context.Context, d Dataset, input io.Reader, w *datasetWriter, progress *progressReporter) (int64, error) {
 	gz, err := gzip.NewReader(input)
 	if err != nil {
 		return 0, err
@@ -66,18 +66,13 @@ func parseGzip(ctx context.Context, d Dataset, input io.Reader, w *datasetWriter
 		if err != nil {
 			return rows, fmt.Errorf("line %d: %w", rows+1, err)
 		}
-		if progress != nil && rows%10000 == 0 {
-			progress(Progress{Dataset: d, Rows: rows})
-		}
+		progress.rows(rows)
 	}
 	if err := scanner.Err(); err != nil {
 		return rows, err
 	}
 	if err := ctx.Err(); err != nil {
 		return rows, err
-	}
-	if progress != nil {
-		progress(Progress{Dataset: d, Rows: rows})
 	}
 	return rows, gz.Close()
 }

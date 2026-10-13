@@ -23,12 +23,14 @@ type SourceInfo struct {
 	URL          string  `json:"url,omitempty"`
 	ETag         string  `json:"etag,omitempty"`
 	LastModified string  `json:"last_modified,omitempty"`
-	SHA256       string  `json:"sha256"` // compressed input bytes
-	Rows         int64   `json:"rows"`   // excluding header, including filtered records
+	SHA256       string  `json:"sha256"`               // compressed input bytes
+	Rows         int64   `json:"rows"`                 // excluding header, including filtered records
+	SizeBytes    int64   `json:"size_bytes,omitempty"` // source-supplied compressed size; <= 0 means unknown
 }
 
 // Source supplies complete gzip streams. Open and the returned reader must honor
-// cancellation; Update owns and closes each returned reader.
+// cancellation; Update owns and closes each returned reader. Sources may supply
+// SourceInfo.SizeBytes for progress totals; it is advisory, not a checksum.
 type Source interface {
 	Open(context.Context, Dataset) (io.ReadCloser, SourceInfo, error)
 }
@@ -92,6 +94,6 @@ func (s HTTPSource) Open(ctx context.Context, d Dataset) (io.ReadCloser, SourceI
 	}
 	return resp.Body, SourceInfo{
 		Dataset: d, URL: resp.Request.URL.String(), ETag: resp.Header.Get("ETag"),
-		LastModified: resp.Header.Get("Last-Modified"),
+		LastModified: resp.Header.Get("Last-Modified"), SizeBytes: max(resp.ContentLength, 0),
 	}, nil
 }

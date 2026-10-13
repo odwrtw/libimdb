@@ -55,7 +55,48 @@ Supply `HTTPSource{Client: client, BaseURL: base}` to customize HTTP policy, or 
 `Source`/`SourceFunc` to open existing gzip files or other streams. Update owns
 and closes each stream. Sources must honor context cancellation; an arbitrary
 blocking reader cannot be forcibly interrupted by the library.
-The optional progress callback is synchronous and must return promptly.
+
+### Update progress
+
+The library is silent unless `UpdateOptions.Progress` is supplied:
+
+```go
+info, err := imdb.Update(ctx, "imdb.sqlite", imdb.UpdateOptions{
+    Progress: func(p imdb.Progress) {
+        if p.Dataset != "" {
+            fmt.Fprintf(os.Stderr, "attempt %d: %s %s, %d compressed bytes, %d rows\n",
+                p.Attempt, p.Phase, p.Dataset, p.BytesRead, p.Rows)
+        } else {
+            fmt.Fprintf(os.Stderr, "attempt %d: %s\n", p.Attempt, p.Phase)
+        }
+    },
+})
+```
+
+The callback receives synchronous snapshots and must return promptly; slow
+callbacks slow the import. Do not reenter `Update` from it. Cancel the update's
+context to stop. Nil disables reporting. Ordinary counters are throttled to
+about four notifications per second; phase boundaries and final dataset counters
+are always delivered. There is no background heartbeat during blocking work.
+
+`Phase` reports `Preparing`, `Opening`, `Importing`, `DatasetDone`, `Indexing`,
+`Validating`, `Committing`, `Retrying`, `Done`, or `Failed`. Only dataset phases
+carry `Dataset` and counters; update-wide events have an empty dataset. `Done`
+means the catalog committed successfully. `DatasetDone` follows checksum
+validation and successful stream closure, not merely reading the last byte.
+`Retrying` and `Failed` carry `Err`; cancellation is a `Failed` event.
+
+`Attempt` is one-based (zero if options are rejected before any attempt), and
+`Attempts` is the maximum allowed. Counters reset on each dataset and full-update
+retry. `Rows` excludes the TSV header and includes successfully processed
+filtered records, not just retained catalog rows. `BytesRead` counts compressed
+input. Gzip/parser read-ahead means bytes and rows advance independently, and
+**100% of input bytes is not 100% of the database update**. Indexing, validation,
+and commit have phases but no measurable percentage.
+
+`TotalBytes` is advisory; zero means unknown. HTTP sources use a known content
+length. Custom sources can supply `SourceInfo.SizeBytes`; known sizes are stored
+as optional provenance (`size_bytes`), and older catalogs remain readable.
 
 ### Database safety and concurrency
 
@@ -146,7 +187,25 @@ and fuzzy matches remain suggestions only.
 ```sh
 go run ./cmd/imdb update -db imdb.sqlite
 go run ./cmd/imdb update -db imdb.sqlite -input-dir /path/to/existing/gzip/files
+go run ./cmd/imdb update -db imdb.sqlite -progress always  # progress even when redirected
+go run ./cmd/imdb update -db imdb.sqlite -progress never   # suppress progress
 go run ./cmd/imdb info -db imdb.sqlite
 go run ./cmd/imdb query -db imdb.sqlite -title 'The Matrix' -kind movie -year 1999
 go run ./cmd/imdb query -db imdb.sqlite -title 'The Matrx' -candidates
 ```
+
+Updates default to `-progress auto`: a live status on terminal stderr (except
+`TERM=dumb`), showing the current file, compressed bytes/percentage when size is
+known, rows, attempts, and database phases. `-input-dir` uses regular-file sizes.
+Completed files and retries retain a summary line. Unknown sizes show bytes and
+rows without an invented percentage.
+
+`-progress always` enables progress on any stderr destination, using plain
+newline records instead of terminal escapes when it is not an interactive
+terminal. `-progress never` disables it. Progress is best-effort; display-write
+failures do not abort the update.
+
+Results remain JSON on stdout. With redirected stderr, default/`never` errors
+remain JSON-only; `always` deliberately mixes human progress lines with the
+final JSON error. The display ends before result/error output, and existing
+signal cancellation and exit codes are unchanged.

@@ -26,7 +26,7 @@ func main() {
 var errHelp = errors.New("help requested")
 
 func execute(ctx context.Context, args []string, out, stderr io.Writer) int {
-	if err := run(ctx, args, out); err != nil {
+	if err := run(ctx, args, out, stderr); err != nil {
 		if errors.Is(err, errHelp) {
 			return 0
 		}
@@ -47,7 +47,7 @@ func execute(ctx context.Context, args []string, out, stderr io.Writer) int {
 	return 0
 }
 
-func run(ctx context.Context, args []string, out io.Writer) error {
+func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	if len(args) == 0 {
 		return fmt.Errorf("%w: usage: imdb update|query|info [flags]", imdb.ErrInvalidQuery)
 	}
@@ -65,11 +65,15 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 		base := flags.String("base-url", "", "dataset base URL; defaults to https://datasets.imdbws.com/")
 		attempts := flags.Int("attempts", 1, "maximum full-update attempts (1-5)")
 		timeout := flags.Duration("timeout", 2*time.Hour, "overall update deadline")
+		progressMode := flags.String("progress", "auto", "progress on stderr: auto (terminal only), always, or never")
 		if err := parseFlags(flags, args[1:], out); err != nil {
 			return err
 		}
 		if flags.NArg() != 0 || (*dir != "" && *base != "") || *timeout <= 0 {
 			return imdb.ErrInvalidQuery
+		}
+		if *progressMode != "auto" && *progressMode != "always" && *progressMode != "never" {
+			return fmt.Errorf("%w: progress must be auto, always, or never", imdb.ErrInvalidQuery)
 		}
 		var source imdb.Source = imdb.HTTPSource{BaseURL: *base}
 		if *dir != "" {
@@ -79,12 +83,31 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 				}
 				filename := filepath.Join(*dir, string(d))
 				f, err := os.Open(filename)
-				return f, imdb.SourceInfo{URL: filename}, err
+				if err != nil {
+					return nil, imdb.SourceInfo{}, err
+				}
+				stat, err := f.Stat()
+				if err != nil {
+					_ = f.Close()
+					return nil, imdb.SourceInfo{}, err
+				}
+				var size int64
+				if stat.Mode().IsRegular() {
+					size = stat.Size()
+				}
+				return f, imdb.SourceInfo{URL: filename, SizeBytes: size}, nil
 			})
 		}
 		updateCtx, cancel := context.WithTimeout(ctx, *timeout)
 		defer cancel()
-		info, err := imdb.Update(updateCtx, *path, imdb.UpdateOptions{Source: source, Attempts: *attempts})
+		display := newProgressDisplay(stderr, *progressMode, terminalWriter(stderr))
+		defer display.finish()
+		opts := imdb.UpdateOptions{Source: source, Attempts: *attempts}
+		if display != nil {
+			opts.Progress = display.report
+		}
+		info, err := imdb.Update(updateCtx, *path, opts)
+		display.finish()
 		if err != nil {
 			return err
 		}

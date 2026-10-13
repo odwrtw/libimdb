@@ -15,15 +15,14 @@ import (
 )
 
 type UpdateOptions struct {
-	Source     Source         // nil uses the official HTTPSource
-	Attempts   int            // default 1, maximum 5; retries restart the entire transaction
-	RetryDelay time.Duration  // default one second
-	Progress   func(Progress) // synchronous; must not reenter Update
-}
-
-type Progress struct {
-	Dataset Dataset
-	Rows    int64
+	Source     Source        // nil uses the official HTTPSource
+	Attempts   int           // default 1, maximum 5; retries restart the entire transaction
+	RetryDelay time.Duration // default one second
+	// Progress receives synchronous snapshots, including lifecycle and retry
+	// events. It must return promptly and must not reenter Update. Ordinary
+	// counters are throttled to about four events/second; boundaries are always
+	// reported. Nil disables reporting. Cancel the context to stop an update.
+	Progress func(Progress)
 }
 
 // Update creates or refreshes a catalog in one transaction, without dataset
@@ -39,28 +38,37 @@ func Update(ctx context.Context, path string, opts UpdateOptions) (Info, error) 
 	if opts.RetryDelay == 0 {
 		opts.RetryDelay = time.Second
 	}
+	progress := &progressReporter{callback: opts.Progress, now: time.Now, current: Progress{Attempts: opts.Attempts}}
+	fail := func(err error) (Info, error) {
+		progress.phase(Failed, err)
+		return Info{}, err
+	}
 	if opts.Attempts < 1 || opts.Attempts > 5 || opts.RetryDelay < 0 {
-		return Info{}, fmt.Errorf("imdb: invalid update options")
+		return fail(fmt.Errorf("imdb: invalid update options"))
 	}
 	if opts.Source == nil {
 		opts.Source = HTTPSource{}
 	}
-	for attempt := 0; ; attempt++ {
-		info, err := updateOnce(ctx, path, opts)
+	for attempt := 1; ; attempt++ {
+		progress.current.Attempt = attempt
+		progress.phase(Preparing, nil)
+		info, err := updateOnce(ctx, path, opts, progress)
 		if err == nil {
+			progress.phase(Done, nil)
 			return info, nil
 		}
 		if ctx.Err() != nil {
-			return Info{}, ctx.Err()
+			return fail(ctx.Err())
 		}
-		if attempt+1 >= opts.Attempts || !retryable(err) {
-			return Info{}, err
+		if attempt >= opts.Attempts || !retryable(err) {
+			return fail(err)
 		}
+		progress.phase(Retrying, err)
 		timer := time.NewTimer(opts.RetryDelay)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return Info{}, ctx.Err()
+			return fail(ctx.Err())
 		case <-timer.C:
 		}
 	}
@@ -75,7 +83,7 @@ func retryable(err error) bool {
 	return errors.As(err, &network) || errors.Is(err, io.ErrUnexpectedEOF)
 }
 
-func updateOnce(ctx context.Context, path string, opts UpdateOptions) (Info, error) {
+func updateOnce(ctx context.Context, path string, opts UpdateOptions, progress *progressReporter) (Info, error) {
 	db, err := openDB(ctx, path, true)
 	if err != nil {
 		return Info{}, err
@@ -125,7 +133,7 @@ func updateOnce(ctx context.Context, path string, opts UpdateOptions) (Info, err
 	defer writer.close()
 	info := Info{SchemaVersion: schemaVersion, NormalizationVersion: normalizationVersion, Generation: rand.Text()}
 	for _, d := range []Dataset{Basics, Aliases, Ratings} {
-		src, err := importDataset(ctx, d, opts, writer)
+		src, err := importDataset(ctx, d, opts, writer, progress)
 		if err != nil {
 			return Info{}, fmt.Errorf("imdb: %s: %w", d, err)
 		}
@@ -135,9 +143,11 @@ func updateOnce(ctx context.Context, path string, opts UpdateOptions) (Info, err
 	if info.Counts.Movies+info.Counts.Shows == 0 {
 		return Info{}, fmt.Errorf("imdb: empty title dataset")
 	}
+	progress.phase(Indexing, nil)
 	if _, err := tx.ExecContext(ctx, indexes); err != nil {
 		return Info{}, err
 	}
+	progress.phase(Validating, nil)
 	var problem string
 	if err := tx.QueryRowContext(ctx, "PRAGMA quick_check").Scan(&problem); err != nil {
 		return Info{}, err
@@ -156,13 +166,21 @@ func updateOnce(ctx context.Context, path string, opts UpdateOptions) (Info, err
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf("PRAGMA application_id=%d; PRAGMA user_version=%d", applicationID, schemaVersion)); err != nil {
 		return Info{}, err
 	}
+	progress.phase(Committing, nil)
+	if err := ctx.Err(); err != nil {
+		return Info{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return Info{}, fmt.Errorf("imdb: commit: %w", err)
 	}
 	return info, nil
 }
 
-func importDataset(ctx context.Context, d Dataset, opts UpdateOptions, w *datasetWriter) (SourceInfo, error) {
+func importDataset(ctx context.Context, d Dataset, opts UpdateOptions, w *datasetWriter, progress *progressReporter) (SourceInfo, error) {
+	progress.opening(d)
+	if err := ctx.Err(); err != nil {
+		return SourceInfo{}, err
+	}
 	body, info, err := opts.Source.Open(ctx, d)
 	if err != nil {
 		return SourceInfo{}, err
@@ -170,15 +188,20 @@ func importDataset(ctx context.Context, d Dataset, opts UpdateOptions, w *datase
 	if body == nil {
 		return SourceInfo{}, fmt.Errorf("source returned a nil stream")
 	}
-	closed := false
+	closed, complete := false, false
 	defer func() {
 		if !closed {
 			_ = body.Close()
 		}
+		if !complete {
+			progress.emit(true) // final counters, even when parsing or closure failed
+		}
 	}()
+	info.SizeBytes = max(info.SizeBytes, 0)
+	progress.importing(info.SizeBytes)
 	hash := sha256.New()
-	reader := io.TeeReader(contextReader{ctx: ctx, reader: body}, hash)
-	rows, err := parseGzip(ctx, d, reader, w, opts.Progress)
+	reader := io.TeeReader(contextReader{ctx: ctx, reader: body, progress: progress}, hash)
+	rows, err := parseGzip(ctx, d, reader, w, progress)
 	if err != nil {
 		return SourceInfo{}, err
 	}
@@ -190,19 +213,25 @@ func importDataset(ctx context.Context, d Dataset, opts UpdateOptions, w *datase
 	}
 	info.Dataset, info.Rows = d, rows
 	info.SHA256 = hex.EncodeToString(hash.Sum(nil))
+	complete = true
+	progress.current.Phase = DatasetDone
+	progress.emit(true)
 	return info, nil
 }
 
 type contextReader struct {
-	ctx    context.Context
-	reader io.Reader
+	ctx      context.Context
+	reader   io.Reader
+	progress *progressReporter
 }
 
 func (r contextReader) Read(p []byte) (int, error) {
 	if err := r.ctx.Err(); err != nil {
 		return 0, err
 	}
-	return r.reader.Read(p)
+	n, err := r.reader.Read(p)
+	r.progress.bytes(n)
+	return n, err
 }
 
 // Keep all database writes on this transaction; there are no nested DB queries.
