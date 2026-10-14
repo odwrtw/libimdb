@@ -37,9 +37,11 @@ The default source is `https://datasets.imdbws.com/`, using
 
 Data flows directly from HTTP through gzip/TSV parsing into prepared SQLite
 statements. Neither compressed/extracted dataset temporary files nor whole-file
-buffers are used. Rows are limited to 1 MiB. Trigram posting inserts are batched
-per name. All three datasets, search indexes, metadata, and checksums commit in
-one transaction. Removed facts disappear on successful refresh.
+buffers are used. Rows are limited to 1 MiB. Suggestion names are deduplicated by
+IMDb ID and folded name; trigram inserts are batched per distinct entry. Raw
+aliases and their metadata remain intact. All three datasets, search indexes,
+metadata, and checksums commit in one transaction. Removed facts disappear on
+successful refresh.
 
 Any transfer, parse, checksum, insertion, close, cancellation, or commit failure
 preserves the previous committed catalog. A failed first creation can leave an
@@ -96,7 +98,7 @@ and commit have phases but no measurable percentage.
 
 `TotalBytes` is advisory; zero means unknown. HTTP sources use a known content
 length. Custom sources can supply `SourceInfo.SizeBytes`; known sizes are stored
-as optional provenance (`size_bytes`), and older catalogs remain readable.
+as optional provenance (`size_bytes`); its absence means the size is unknown.
 
 ### Database safety and concurrency
 
@@ -112,9 +114,10 @@ as optional provenance (`size_bytes`), and older catalogs remain readable.
 - Do not open this changing database with SQLite `immutable=1`.
 - Read-only container deployments must mount the catalog directory with the
   required WAL/SHM files available. Validate the actual mount/checkpoint setup.
-- Unknown schemas, foreign databases, and tapis's old unversioned database are
-  rejected, never overwritten. For the initial migration, build at a new path
-  and explicitly point consumers to it.
+- Readers and refreshes require **schema v2**. Other schemas and foreign or
+  unversioned databases are rejected with `ErrSchema`, never overwritten. To
+  rebuild an incompatible catalog, use a new path and explicitly point consumers
+  to it.
 - SQLite refreshes do not compact the database automatically.
 
 ## Lookup and safe resolution
@@ -159,28 +162,65 @@ Popularity never selects an identity. Queries are limited to 1,024 bytes and
 
 ```go
 result, err := catalog.Candidates(ctx, imdb.Query{
-    Title: "The Matrx", Kind: imdb.Movie,
+    Title: "matrix", Kind: imdb.Movie,
 }, imdb.SearchOptions{Limit: 20})
 ```
 
-Candidate search uses indexed normalized names, accent/punctuation-folded
-prefixes, and overlapping trigrams, followed by rune-aware edit-distance
-scoring. It does not scan every catalog title for fuzzy similarity.
-Short names do not use typo scoring. Each candidate exposes its matched name,
-method, and score; the score is a ranking value, **not a confidence probability**.
+Candidate search uses indexed normalized names and accent/punctuation-folded
+prefixes and substrings. Substring matching starts at **three folded Unicode
+characters**, so `matrix` finds `The Matrix` and interior fragments work too.
+One- and two-character queries use exact/prefix matching only. SQL wildcards and
+operators have no special meaning; punctuation is folded as described above.
 
-This is heuristic retrieval, not guaranteed exhaustive fuzzy search. Names with
-no shared trigram may not be retrieved. `Truncated` reports per-stage budget or
-output-limit clipping, not overall fuzzy-search recall. Default budget: 1,000
-names per stage; maximum: 10,000. Output limit: default 20, maximum 100.
-SQL work on common grams can still be substantial; use context deadlines.
-Trigram overlap orders the bounded retrieval before edit scoring. Names are
-deduplicated by IMDb ID and ordered deterministically by match method,
-score, votes, ID, and matched name.
+When direct results do not fill `Limit`, queries of at least four folded
+characters also retrieve whole-title typo suggestions using rune-aware edit
+distance. Typo search inspects up to three rare trigram posting streams; it does
+not aggregate every common-gram hit or scan every title. Substring retrieval
+uses the least frequent query gram and checks literal containment. Kind-aware
+indexes avoid reading the other kind's prefix/posting entries.
+
+Results are deduplicated by IMDb ID, with full title and matched-alias metadata
+loaded only for the final IDs. Ranking is deterministic: exact, normalized,
+prefix, substring, fuzzy; then score, votes, ID and matched name. Shorter prefix
+and substring matches score higher. Scores are ranking values, **not confidence
+probabilities**. Lossy accent/punctuation equivalence remains `fuzzy`.
+
+This is heuristic retrieval, not guaranteed exhaustive search or a globally
+optimal popularity ranking. Default `Budget`: 1,000 entries/postings per stage;
+maximum: 10,000. Exact retrieval counts distinct IDs; prefix/substring retrieval
+counts compact entries; all selected typo streams share one posting budget.
+Budgets apply **before** year/adult and similarity filters. Repeated raw aliases
+do not consume extra entries, but different folded names and postings can.
+Each stream may read one extra row to detect clipping. Default output `Limit`:
+20; maximum: 100.
+
+`Truncated` reports budget or output-limit clipping, even when filtering leaves
+no returned matches. It does not measure overall typo recall: a title sharing
+no selected gram may be missed. Skipping typo fallback because direct results
+fill the limit is normal search policy, not clipping. Use context deadlines;
+indexed safe-name ambiguity detection and final alias selection still process
+raw matching aliases.
 
 **Never infer a unique identity from candidates, their rank, or their count.**
 Use `Resolve` for authoritative automated selection. Accent/punctuation folding
 and fuzzy matches remain suggestions only.
+
+## Search validation and benchmarks
+
+Routine tests and `BenchmarkSearch`/`BenchmarkSearchUpdate` use synthetic,
+duplicate-heavy datasets. Optional real-data checks open an existing **v2**
+catalog read-only and never refresh it:
+
+```sh
+go test -run '^$' -bench '^(BenchmarkSearch|BenchmarkSearchUpdate)$' -benchmem .
+LIBIMDB_BENCH_DB=/path/to/imdb.sqlite go test -run '^TestRealCatalogSearch$' \
+    -bench '^BenchmarkRealCatalog$' -benchmem -v .
+```
+
+The real benchmark reports SQLite version, catalog generation and counts. Record
+hardware, cache state and budgets when comparing runs; its timings are not a
+latency guarantee. Existing refreshes reuse SQLite pages and do not automatically
+shrink the database file, even when search postings become smaller.
 
 ## CLI
 
@@ -194,7 +234,8 @@ go run ./cmd/imdb update -db imdb.sqlite -progress always  # progress even when 
 go run ./cmd/imdb update -db imdb.sqlite -progress never   # suppress progress
 go run ./cmd/imdb info -db imdb.sqlite
 go run ./cmd/imdb query -db imdb.sqlite -title 'The Matrix' -kind movie -year 1999
-go run ./cmd/imdb query -db imdb.sqlite -title 'The Matrx' -candidates
+go run ./cmd/imdb query -db imdb.sqlite -title 'matrix' -kind movie -candidates
+go run ./cmd/imdb query -db imdb.sqlite -title 'The Matrx' -kind movie -candidates
 ```
 
 Updates default to `-progress auto`: a live status on terminal stderr (except

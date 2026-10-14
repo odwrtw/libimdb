@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	schemaVersion = 1
+	schemaVersion = 2
 	applicationID = 0x494d4442
 )
 
@@ -45,10 +45,25 @@ CREATE TABLE names (
 	attributes TEXT,
 	is_original INTEGER
 );
-CREATE TABLE name_grams (
+CREATE TABLE search_names (
+	id INTEGER PRIMARY KEY,
+	imdb_id TEXT NOT NULL REFERENCES titles(imdb_id),
+	kind TEXT NOT NULL CHECK(kind IN ('movie','show')),
+	fuzzy_key TEXT NOT NULL,
+	rune_length INTEGER NOT NULL,
+	UNIQUE(imdb_id,fuzzy_key)
+);
+CREATE TABLE search_grams (
 	gram TEXT NOT NULL,
-	name_id INTEGER NOT NULL REFERENCES names(id),
-	PRIMARY KEY(gram,name_id)
+	kind TEXT NOT NULL,
+	search_id INTEGER NOT NULL REFERENCES search_names(id),
+	PRIMARY KEY(gram,kind,search_id)
+) WITHOUT ROWID;
+CREATE TABLE gram_counts (
+	gram TEXT NOT NULL,
+	kind TEXT NOT NULL,
+	entries INTEGER NOT NULL,
+	PRIMARY KEY(gram,kind)
 ) WITHOUT ROWID;
 CREATE TABLE catalog_info (
 	singleton INTEGER PRIMARY KEY CHECK(singleton=1),
@@ -58,8 +73,10 @@ CREATE TABLE catalog_info (
 
 const indexes = `
 CREATE INDEX names_by_key ON names(name_key,imdb_id);
-CREATE INDEX names_by_fuzzy_key ON names(fuzzy_key,id);
-CREATE INDEX names_by_title ON names(imdb_id);
+CREATE INDEX names_by_title ON names(imdb_id,fuzzy_key);
+CREATE INDEX search_by_prefix ON search_names(fuzzy_key,id);
+CREATE INDEX search_by_kind_prefix ON search_names(kind,fuzzy_key,id);
+INSERT INTO gram_counts SELECT gram,kind,count(*) FROM search_grams GROUP BY gram,kind;
 `
 
 func openDB(ctx context.Context, path string, write bool) (*sql.DB, error) {
@@ -123,7 +140,8 @@ func readInfo(ctx context.Context, db sqlReader) (Info, error) {
 	return info, nil
 }
 
-// Empty databases are eligible for creation; arbitrary or legacy databases are not.
+// Only empty databases and owned catalogs using the current schema are eligible.
+// The result reports whether the database is empty and needs creation.
 func validateWriter(ctx context.Context, db sqlReader) (bool, error) {
 	var app, version, tables int
 	if err := db.QueryRowContext(ctx, "PRAGMA application_id").Scan(&app); err != nil {

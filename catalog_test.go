@@ -555,7 +555,8 @@ func TestSQLInjectionAndLimits(t *testing.T) {
 
 func TestResolveUsesNameIndex(t *testing.T) {
 	_, c, _ := newCatalog(t)
-	rows, err := c.db.Query("EXPLAIN QUERY PLAN SELECT n.imdb_id FROM names n WHERE n.name_key=?", "dune")
+	query, args := resolveIDsQuery(Query{Title: "Dune", Kind: Movie, Year: 2021, ExcludeAdult: true})
+	rows, err := c.db.Query("EXPLAIN QUERY PLAN "+query, args...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -568,6 +569,9 @@ func TestResolveUsesNameIndex(t *testing.T) {
 			t.Fatal(err)
 		}
 		indexed = indexed || strings.Contains(detail, "names_by_key")
+		if strings.Contains(detail, "DISTINCT") || strings.Contains(detail, "SCAN n") {
+			t.Fatalf("resolver should stream the covering name index: %s", detail)
+		}
 	}
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)

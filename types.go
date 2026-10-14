@@ -61,6 +61,7 @@ const (
 	Exact      Method = "exact"
 	Normalized Method = "normalized"
 	Prefix     Method = "prefix"
+	Substring  Method = "substring"
 	Fuzzy      Method = "fuzzy"
 )
 
@@ -73,7 +74,7 @@ type Match struct {
 
 type SearchOptions struct {
 	Limit  int // default 20, maximum 100
-	Budget int // names per indexed search stage; default 1000, maximum 10000
+	Budget int // entries/postings inspected per stage, before filters; default 1000, maximum 10000
 }
 
 type SearchResult struct {

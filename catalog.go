@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 )
 
 // Catalog is a concurrency-safe read-only handle. Each operation reads one
@@ -177,9 +176,27 @@ func (c *Catalog) Names(ctx context.Context, id string) ([]Name, error) {
 	return result, nil
 }
 
-const queryFilter = " AND (?='' OR t.kind=?) AND (?=0 OR t.year=?) AND (?=0 OR coalesce(t.adult,0)=0)"
+func queryFilters(q Query) (string, []any) {
+	var where string
+	var args []any
+	if q.Kind != "" {
+		where += " AND t.kind=?"
+		args = append(args, q.Kind)
+	}
+	if q.Year != 0 {
+		where += " AND t.year=?"
+		args = append(args, q.Year)
+	}
+	if q.ExcludeAdult {
+		where += " AND coalesce(t.adult,0)=0"
+	}
+	return where, args
+}
 
-func filterArgs(q Query) []any { return []any{q.Kind, q.Kind, q.Year, q.Year, q.ExcludeAdult} }
+func resolveIDsQuery(q Query) (string, []any) {
+	where, filters := queryFilters(q)
+	return "SELECT DISTINCT n.imdb_id FROM names n JOIN titles t ON t.imdb_id=n.imdb_id WHERE n.name_key=?" + where + " LIMIT 2", append([]any{nameKey(q.Title)}, filters...)
+}
 
 type namedTitle struct {
 	match  Match
@@ -224,8 +241,8 @@ func (c *Catalog) Resolve(ctx context.Context, q Query) (Match, error) {
 	}
 	defer func() { _ = tx.Rollback() }()
 	key := nameKey(q.Title)
-	args := append([]any{key}, filterArgs(q)...)
-	rows, err := tx.QueryContext(ctx, "SELECT DISTINCT t.imdb_id FROM names n JOIN titles t ON t.imdb_id=n.imdb_id WHERE n.name_key=?"+queryFilter+" LIMIT 2", args...)
+	query, args := resolveIDsQuery(q)
+	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return Match{}, err
 	}
@@ -264,8 +281,6 @@ func (c *Catalog) Resolve(ctx context.Context, q Query) (Match, error) {
 	result.match.Score = 1
 	return result.match, nil
 }
-
-func placeholders(n int) string { return strings.TrimSuffix(strings.Repeat("?,", n), ",") }
 
 func queryError(err error) error {
 	return fmt.Errorf("imdb: candidate query: %w", err)

@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"time"
+	"unicode/utf8"
 )
 
 type UpdateOptions struct {
@@ -27,7 +28,8 @@ type UpdateOptions struct {
 
 // Update creates or refreshes a catalog in one transaction, without dataset
 // temporary files or whole-download buffers. The catalog must be owned by this
-// library or empty. Existing legacy/foreign databases are never overwritten.
+// library using the current schema or empty. Foreign, unversioned and
+// incompatible-schema databases are never overwritten.
 // WAL is used for concurrent readers; SQLite's own transaction files are required.
 // A failed update preserves previous committed data; a failed first creation may
 // leave an empty, uninitialized database file.
@@ -109,21 +111,21 @@ func updateOnce(ctx context.Context, path string, opts UpdateOptions, progress *
 	if err != nil {
 		return Info{}, err
 	}
-	if create {
-		if _, err := tx.ExecContext(ctx, schema); err != nil {
-			return Info{}, err
-		}
-	} else {
+	if !create {
+		// Drop children first. Rollback restores the schema, facts, indexes
+		// and generation if the refresh fails.
 		if _, err := tx.ExecContext(ctx, `
-			DROP INDEX names_by_key;
-			DROP INDEX names_by_fuzzy_key;
-			DROP INDEX names_by_title;
-			DELETE FROM name_grams;
-			DELETE FROM names;
-			DELETE FROM titles;
-			DELETE FROM catalog_info;`); err != nil {
+			DROP TABLE gram_counts;
+			DROP TABLE search_grams;
+			DROP TABLE search_names;
+			DROP TABLE names;
+			DROP TABLE titles;
+			DROP TABLE catalog_info;`); err != nil {
 			return Info{}, err
 		}
+	}
+	if _, err := tx.ExecContext(ctx, schema); err != nil {
+		return Info{}, err
 	}
 
 	writer, err := newDatasetWriter(ctx, tx)
@@ -236,12 +238,13 @@ func (r contextReader) Read(p []byte) (int, error) {
 
 // Keep all database writes on this transaction; there are no nested DB queries.
 type datasetWriter struct {
-	title  *sql.Stmt
-	name   *sql.Stmt
-	gram   *sql.Stmt
-	rating *sql.Stmt
-	exists *sql.Stmt
-	counts Counts
+	title      *sql.Stmt
+	name       *sql.Stmt
+	searchName *sql.Stmt
+	gram       *sql.Stmt
+	rating     *sql.Stmt
+	exists     *sql.Stmt
+	counts     Counts
 }
 
 func newDatasetWriter(ctx context.Context, tx *sql.Tx) (*datasetWriter, error) {
@@ -252,7 +255,8 @@ func newDatasetWriter(ctx context.Context, tx *sql.Tx) (*datasetWriter, error) {
 	}{
 		{&w.title, "INSERT INTO titles(imdb_id,kind,title_type,primary_title,original_title,year,end_year,runtime,adult,genres) VALUES(?,?,?,?,?,?,?,?,?,?)"},
 		{&w.name, "INSERT INTO names(imdb_id,title,name_key,fuzzy_key,source,region,language,types,attributes,is_original) SELECT ?,?,?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM titles WHERE imdb_id=?)"},
-		{&w.gram, "INSERT INTO name_grams(gram,name_id) SELECT value,? FROM json_each(?)"},
+		{&w.searchName, "INSERT INTO search_names(imdb_id,kind,fuzzy_key,rune_length) SELECT imdb_id,kind,?,? FROM titles WHERE imdb_id=? ON CONFLICT(imdb_id,fuzzy_key) DO NOTHING RETURNING id,kind"},
+		{&w.gram, "INSERT INTO search_grams(gram,kind,search_id) SELECT value,?,? FROM json_each(?)"},
 		{&w.rating, "UPDATE titles SET rating=?,votes=? WHERE imdb_id=? AND rating IS NULL"},
 		{&w.exists, "SELECT EXISTS(SELECT 1 FROM titles WHERE imdb_id=?)"},
 	} {
@@ -267,7 +271,7 @@ func newDatasetWriter(ctx context.Context, tx *sql.Tx) (*datasetWriter, error) {
 }
 
 func (w *datasetWriter) close() {
-	for _, stmt := range []*sql.Stmt{w.title, w.name, w.gram, w.rating, w.exists} {
+	for _, stmt := range []*sql.Stmt{w.title, w.name, w.searchName, w.gram, w.rating, w.exists} {
 		if stmt != nil {
 			_ = stmt.Close()
 		}
@@ -296,7 +300,12 @@ func (w *datasetWriter) addName(ctx context.Context, id string, n Name) error {
 		return nil
 	}
 	w.counts.Names++
-	nameID, err := result.LastInsertId()
+	var searchID int64
+	var kind Kind
+	err = w.searchName.QueryRowContext(ctx, folded, utf8.RuneCountInString(folded), id).Scan(&searchID, &kind)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil // Another raw name already indexed this title/folded-name pair.
+	}
 	if err != nil {
 		return err
 	}
@@ -304,7 +313,7 @@ func (w *datasetWriter) addName(ctx context.Context, id string, n Name) error {
 	if err != nil {
 		return err
 	}
-	_, err = w.gram.ExecContext(ctx, nameID, string(data))
+	_, err = w.gram.ExecContext(ctx, kind, searchID, string(data))
 	return err
 }
 

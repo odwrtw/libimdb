@@ -55,6 +55,7 @@ func TestCommands(t *testing.T) {
 		{[]string{"info", "-db", path}, 0},
 		{[]string{"query", "-db", path, "-title", "Film", "-year", "2000"}, 0},
 		{[]string{"query", "-db", path, "-title", "Film", "-candidates"}, 0},
+		{[]string{"query", "-db", path, "-title", "ilm", "-kind", "movie", "-candidates"}, 0},
 		{[]string{"query", "-db", path, "-title", "Film"}, 3},
 		{[]string{"query", "-db", path, "-title", "missing"}, 2},
 		{[]string{"query", "-db", path}, 4},
@@ -77,6 +78,22 @@ func TestCommands(t *testing.T) {
 		if code != 0 && !json.Valid(stderr.Bytes()) {
 			t.Fatalf("non-JSON error: %s", stderr.String())
 		}
+	}
+}
+
+func TestSubstringQuery(t *testing.T) {
+	path := cliCatalog(t)
+	var out, stderr bytes.Buffer
+	code := execute(context.Background(), []string{"query", "-db", path, "-title", "ilm", "-kind", "movie", "-candidates"}, &out, &stderr)
+	if code != 0 {
+		t.Fatalf("substring query exit %d: %s", code, stderr.String())
+	}
+	var result imdb.SearchResult
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Matches) != 2 || result.Matches[0].Method != imdb.Substring || result.Matches[0].Title.ID != "tt1" {
+		t.Fatalf("substring CLI results: %+v", result)
 	}
 }
 
