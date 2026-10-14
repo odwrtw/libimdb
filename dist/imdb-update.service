@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh the IMDb catalog
+
+[Service]
+Type=oneshot
+StateDirectory=imdb
+# Change the executable and database paths to suit your installation.
+ExecStart="%h/.local/bin/imdb" update -db "%S/imdb/imdb.sqlite" -attempts 2
+# Let the CLI enforce its overall deadline (default: 2h; adjust with -timeout).
+TimeoutStartSec=infinity

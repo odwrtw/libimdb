@@ -1,4 +1,5 @@
 .cache/
+imdb
 *.sqlite
 *.sqlite-journal
 *.sqlite-wal

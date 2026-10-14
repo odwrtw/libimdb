@@ -184,6 +184,9 @@ and fuzzy matches remain suggestions only.
 
 ## CLI
 
+For a daily refresh using the binary built by `./build.sh`, see the
+[systemd user service and timer examples](dist/README.md).
+
 ```sh
 go run ./cmd/imdb update -db imdb.sqlite
 go run ./cmd/imdb update -db imdb.sqlite -input-dir /path/to/existing/gzip/files
