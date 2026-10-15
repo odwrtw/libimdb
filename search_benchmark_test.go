@@ -30,7 +30,7 @@ func BenchmarkSearch(b *testing.B) {
 		b.Fatal(err)
 	}
 	benchmarkSearch(b, path, []Query{
-		{Title: "The Synthetic Movie 500", Kind: Movie, Year: 2000},
+		{Title: "The Synthetic Movie 500", Kind: Movie, StartYear: 2000},
 		{Title: "Synthetic Movie 500", Kind: Movie},
 		{Title: "The Synthetic Movi 500", Kind: Movie},
 		{Title: "The", Kind: Movie},
@@ -43,7 +43,7 @@ func BenchmarkRealCatalog(b *testing.B) {
 		b.Skip("set LIBIMDB_BENCH_DB to a catalog using the current schema")
 	}
 	benchmarkSearch(b, path, []Query{
-		{Title: "The Matrix", Kind: Movie, Year: 1999},
+		{Title: "The Matrix", Kind: Movie, StartYear: 1999},
 		{Title: "matrix", Kind: Movie},
 		{Title: "The Matrx", Kind: Movie},
 		{Title: "breaking bad", Kind: Show},

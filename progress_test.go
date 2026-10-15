@@ -26,7 +26,7 @@ func TestUpdateProgress(t *testing.T) {
 				files[d] = compressed(t, text)
 			}
 			closes := make(map[Dataset]int)
-			source := SourceFunc(func(_ context.Context, d Dataset) (io.ReadCloser, SourceInfo, error) {
+			source := SourceFunc(func(_ context.Context, d Dataset) (io.ReadCloser, SourceMetadata, error) {
 				var reader io.Reader = bytes.NewReader(files[d])
 				size := int64(len(files[d]))
 				if mode == "unknown" {
@@ -38,7 +38,7 @@ func TestUpdateProgress(t *testing.T) {
 				return &closeReader{Reader: reader, close: func() error {
 					closes[d]++
 					return nil
-				}}, SourceInfo{SizeBytes: size}, nil
+				}}, SourceMetadata{SizeBytes: size}, nil
 			})
 			var events []Progress
 			path := filepath.Join(t.TempDir(), "progress.sqlite")
@@ -200,10 +200,10 @@ func TestProgressRetry(t *testing.T) {
 	base := fixtureSource(t, fixtures())
 	calls := make(map[Dataset]int)
 	var events []Progress
-	source := SourceFunc(func(ctx context.Context, d Dataset) (io.ReadCloser, SourceInfo, error) {
+	source := SourceFunc(func(ctx context.Context, d Dataset) (io.ReadCloser, SourceMetadata, error) {
 		calls[d]++
 		if d == Aliases && calls[d] == 1 {
-			return nil, SourceInfo{}, &HTTPError{StatusCode: 503}
+			return nil, SourceMetadata{}, &HTTPError{StatusCode: 503}
 		}
 		return base.Open(ctx, d)
 	})
@@ -264,7 +264,7 @@ func TestProgressPartialTransferRetry(t *testing.T) {
 					files[d] = compressed(t, text)
 				}
 				opens, closes := make(map[Dataset]int), make(map[Dataset]int)
-				source := SourceFunc(func(_ context.Context, d Dataset) (io.ReadCloser, SourceInfo, error) {
+				source := SourceFunc(func(_ context.Context, d Dataset) (io.ReadCloser, SourceMetadata, error) {
 					opens[d]++
 					input := files[d]
 					if d == Aliases {
@@ -281,7 +281,7 @@ func TestProgressPartialTransferRetry(t *testing.T) {
 						closed = true
 						closes[d]++
 						return nil
-					}}, SourceInfo{}, nil
+					}}, SourceMetadata{}, nil
 				})
 				ctx, cancel := context.WithCancel(t.Context())
 				defer cancel()
@@ -375,14 +375,14 @@ func TestProgressFailures(t *testing.T) {
 				files[Ratings] = files[Ratings][:len(files[Ratings])-5]
 			}
 			closes, opens := make(map[Dataset]int), make(map[Dataset]int)
-			source := SourceFunc(func(_ context.Context, d Dataset) (io.ReadCloser, SourceInfo, error) {
+			source := SourceFunc(func(_ context.Context, d Dataset) (io.ReadCloser, SourceMetadata, error) {
 				opens[d]++
 				if d == Ratings && (mode == "permanent" || mode == "retry cancellation") {
 					status := 404
 					if mode == "retry cancellation" {
 						status = 503
 					}
-					return nil, SourceInfo{}, &HTTPError{StatusCode: status}
+					return nil, SourceMetadata{}, &HTTPError{StatusCode: status}
 				}
 				return &closeReader{Reader: bytes.NewReader(files[d]), close: func() error {
 					closes[d]++
@@ -390,7 +390,7 @@ func TestProgressFailures(t *testing.T) {
 						return errors.New("close failure")
 					}
 					return nil
-				}}, SourceInfo{}, nil
+				}}, SourceMetadata{}, nil
 			})
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()

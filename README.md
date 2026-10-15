@@ -12,7 +12,7 @@ The catalog is authoritative for IMDb identity and available IMDb facts:
 
 - Primary/original titles and alternative titles, with alias language/region.
 - Movie/show kind and original IMDb title type.
-- Start/end year, runtime, adult flag, genres, rating, and vote count.
+- Start/end year, runtime in minutes, adult flag, genres, rating, and vote count.
 - Dataset provenance, compressed-input checksums, and catalog generation.
 
 Retained title types are `movie`, `tvMovie`, `tvSeries`, and `tvMiniSeries`.
@@ -20,6 +20,10 @@ Episodes, shorts, people, plots, images, exact air dates, and TMDB/TVDB IDs are
 not included. Application state and provider enrichment belong elsewhere.
 Unknown numeric/boolean fields use pointers; unknown genres are nil.
 Unknown original titles, alias language, and alias region use empty strings.
+Go fields use explicit names: `TitleType`, `StartYear`, `RuntimeMinutes`.
+`Name.Source` is a `NameSource` (`PrimaryName`, `OriginalName`, or `AliasName`).
+`Name.IsOriginal` is IMDb's alias `isOriginalTitle` metadata, not a general
+original-name test; primary/original name records leave it nil.
 
 ## Update from Go
 
@@ -56,9 +60,18 @@ speed is coupled to insert speed; caller deadlines and real-dataset throughput
 measurements are important.
 
 Supply `HTTPSource{Client: client, BaseURL: base}` to customize HTTP policy, or a
-`Source`/`SourceFunc` to open existing gzip files or other streams. Update owns
-and closes each stream. Sources must honor context cancellation; an arbitrary
-blocking reader cannot be forcibly interrupted by the library.
+`Source`/`SourceFunc` to open existing gzip files or other streams. `Source.Open`
+returns `(io.ReadCloser, SourceMetadata, error)`. Source metadata supplies the
+provenance location, ETag, last-modified value and advisory compressed size.
+`Info.Sources` contains `DatasetReport` values combining that metadata with the
+importer's dataset identity, row count, and computed SHA-256. The digest is not
+an expected-checksum input or an external integrity assertion.
+
+On successful open, Update owns and closes the stream. On error the source must
+release any acquired resources. Calls are sequential within an update; retries
+reopen datasets and require fresh, complete streams starting at byte zero.
+Sources must honor context cancellation; an arbitrary blocking reader cannot
+be forcibly interrupted by the library.
 
 ### Update progress
 
@@ -99,8 +112,8 @@ input. Gzip/parser read-ahead means bytes and rows advance independently, and
 and commit have phases but no measurable percentage.
 
 `TotalBytes` is advisory; zero means unknown. HTTP sources use a known content
-length. Custom sources can supply `SourceInfo.SizeBytes`; known sizes are stored
-as optional provenance (`size_bytes`); its absence means the size is unknown.
+length. Custom sources can supply `SourceMetadata.SizeBytes`; known sizes are
+stored as optional provenance (`size_bytes`); its absence means the size is unknown.
 
 ### Database safety and concurrency
 
@@ -111,8 +124,9 @@ as optional provenance (`size_bytes`); its absence means the size is unknown.
   contention is an error, not an implicit competing import.
 - Read-only catalog handles remain valid during refresh. Each operation reads
   one transaction snapshot; its next operation sees newly committed data.
-- Multi-call application workflows needing one generation should compare
-  `Info.Generation`, or use a single batch operation.
+- Use `Catalog.View` for multi-call workflows needing one generation; a separate
+  `Info` call does not identify a previous operation's snapshot. `Resolution`,
+  `SearchResult`, and `AmbiguousError` also report their own generation.
 - Do not open this changing database with SQLite `immutable=1`.
 - Read-only container deployments must mount the catalog directory with the
   required WAL/SHM files available. Validate the actual mount/checkpoint setup.
@@ -132,9 +146,9 @@ if err != nil {
 defer catalog.Close()
 
 match, err := catalog.Resolve(ctx, imdb.Query{
-    Title: "The Matrix",
-    Kind:  imdb.Movie,
-    Year:  1999,
+    Title:     "The Matrix",
+    Kind:      imdb.Movie,
+    StartYear: 1999,
 })
 if err != nil {
     // errors.Is(err, imdb.ErrNotFound) or imdb.ErrAmbiguous are normal
@@ -144,14 +158,37 @@ if err != nil {
 id := match.Title.ID
 ```
 
-`Lookup` returns facts for an ID. `LookupMany` returns a snapshot-consistent map
-for up to 10,000 IDs, omitting absent IDs. `Names` returns primary/original/alias
-names and their metadata. `Info` reports provenance and catalog generation.
+`Resolve` returns a `Resolution`, with matched name, exact/normalized method,
+and generation, but no ranking score. On ambiguity it returns a zero resolution
+and `*AmbiguousError`, which matches `ErrAmbiguous` via `errors.Is`:
+
+```go
+var ambiguity *imdb.AmbiguousError
+if errors.As(err, &ambiguity) {
+    // Distinct safe-name conflicts, sorted by ID, never popularity.
+    for _, title := range ambiguity.Titles {
+        fmt.Println(title.ID, title.PrimaryTitle)
+    }
+    // At most 20 titles; Truncated indicates further conflicts exist.
+    fmt.Println(ambiguity.Generation, ambiguity.Truncated)
+}
+```
+
+These conflicts come from the same snapshot and filters as resolution. Broader
+candidate search is not a replacement for this ambiguity information.
+
+`Lookup` returns facts for an ID, or `ErrNotFound` for an absent or unsupported
+title. IDs are `tt` followed by one or more ASCII digits. `LookupMany` returns a
+snapshot-consistent map for up to 10,000 IDs, omitting absent IDs and collapsing
+duplicates; empty input returns an empty map. `Names` returns raw names and
+metadata in import order, not a preference order or a cross-generation ordering
+guarantee. Distinct original names are included; an original identical to the
+primary is not repeated as `OriginalName`. `Info` reports provenance and generation.
 
 `Query` takes a title, not a filename. Parse filenames outside this library.
-Empty kind searches both kinds; year zero means unspecified. A supplied year is
-a hard constraint, including for records with unknown years. Adult titles are
-included by default; `ExcludeAdult` excludes those explicitly flagged adult.
+Empty kind searches both kinds; `StartYear` zero means unspecified. A supplied
+year is a hard constraint, including for records with unknown years. Adult titles
+are included by default; `ExcludeAdult` excludes those explicitly flagged adult.
 
 Resolution normalizes Unicode NFC, Unicode case, and whitespace only. It never
 removes accents, punctuation, or words. All matching primary/original/alias names
@@ -159,6 +196,39 @@ participate in ambiguity detection; even an exact primary spelling does not
 override an identity collision. Repeated aliases for one ID are not ambiguity.
 Popularity never selects an identity. Queries are limited to 1,024 bytes and
 256 normalized Unicode code points.
+
+### Consistent multi-call reads
+
+```go
+err = catalog.View(ctx, func(view *imdb.View) error {
+    resolved, err := view.Resolve(ctx, imdb.Query{Title: "The Matrix"})
+    if err != nil {
+        return err
+    }
+    names, err := view.Names(ctx, resolved.Title.ID)
+    if err != nil {
+        return err
+    }
+    // resolved and names belong to one generation, even during a refresh.
+    fmt.Println(resolved.Generation, names)
+    return nil
+})
+```
+
+The view also provides `Lookup`, `LookupMany`, `Candidates`, and `Info`. Its
+lifetime is the callback, with cleanup on success, error, or panic. Do not copy,
+retain, or use the view concurrently. Use the view rather than the same catalog
+inside its callback: each catalog serializes operations on one connection.
+Results remain usable after the callback; view calls then return `ErrViewClosed`.
+Keep callbacks short because snapshots can retain WAL space. The view's parent
+context governs its lifetime; individual calls can use shorter deadlines.
+
+### Invalid input
+
+Invalid queries, IDs, paths, HTTP source settings, and update/search options
+return `*ValidationError`, matching `ErrInvalidInput`. Use `errors.As` to obtain
+`Field` and `Problem`; do not parse error strings. Operational failures,
+cancellation, not-found, and ambiguity are separate outcomes.
 
 ## Broader suggestions
 
@@ -181,9 +251,10 @@ not aggregate every common-gram hit or scan every title. Substring retrieval
 uses the least frequent query gram and checks literal containment. Kind-aware
 indexes avoid reading the other kind's prefix/posting entries.
 
-Results are deduplicated by IMDb ID, with full title and matched-alias metadata
-loaded only for the final IDs. Ranking is deterministic: exact, normalized,
-prefix, substring, fuzzy; then score, votes, ID and matched name. Shorter prefix
+`SearchResult.Matches` contains `Candidate` values, a different type from
+`Resolution`. Results are deduplicated by IMDb ID, with full title and
+matched-alias metadata loaded only for the final IDs. Ranking is deterministic:
+exact, normalized, prefix, substring, fuzzy; then score, votes, ID and matched name. Shorter prefix
 and substring matches score higher. Scores are ranking values, **not confidence
 probabilities**. Lossy accent/punctuation equivalence remains `fuzzy`.
 
@@ -196,12 +267,14 @@ do not consume extra entries, but different folded names and postings can.
 Each stream may read one extra row to detect clipping. Default output `Limit`:
 20; maximum: 100.
 
-`Truncated` reports budget or output-limit clipping, even when filtering leaves
-no returned matches. It does not measure overall typo recall: a title sharing
-no selected gram may be missed. Skipping typo fallback because direct results
-fill the limit is normal search policy, not clipping. Use context deadlines;
-indexed safe-name ambiguity detection and final alias selection still process
-raw matching aliases.
+`LimitTruncated` means retrieved matches were omitted to satisfy `Limit`;
+increasing the limit may expose them. `BudgetExhausted` means a retrieval stage
+was clipped by `Budget`, even when filtering leaves no returned matches;
+increasing the budget may retrieve more. Both flags can be true. Neither measures
+overall typo recall: a title sharing no selected gram may be missed. Skipping
+typo fallback because direct results fill the limit is normal search policy,
+not clipping. Use context deadlines; indexed safe-name ambiguity detection and
+final alias selection still process raw matching aliases.
 
 **Never infer a unique identity from candidates, their rank, or their count.**
 Use `Resolve` for authoritative automated selection. Accent/punctuation folding
@@ -255,7 +328,13 @@ newline records instead of terminal escapes when it is not an interactive
 terminal. `-progress never` disables it. Progress is best-effort; display-write
 failures do not abort the update.
 
-Results remain JSON on stdout. With redirected stderr, default/`never` errors
-remain JSON-only; `always` deliberately mixes human progress lines with the
+Results remain JSON on stdout. Resolutions include `generation` and no `score`;
+title JSON uses `start_year` and `runtime_minutes`. Candidate results include
+`limit_truncated` and `budget_exhausted`. JSON errors retain `kind` and `error`,
+with optional `ambiguity` (titles, generation, truncation) or `validation`
+(field, problem) details. `-year` sets `Query.StartYear`.
+
+With redirected stderr, default/`never` errors remain JSON-only; `always`
+deliberately mixes human progress lines with the
 final JSON error. The display ends before result/error output, and existing
 signal cancellation and exit codes are unchanged.

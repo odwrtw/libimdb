@@ -35,7 +35,7 @@ func TestBoundedFuzzyRetrievalAtScale(t *testing.T) {
 			found = true
 		}
 	}
-	if !found || !got.Truncated {
+	if !found || !got.BudgetExhausted {
 		t.Fatalf("target not retained in clipped retrieval: %+v", got)
 	}
 	if _, err := c.Resolve(ctx, Query{Title: "Synthetic Movi 500"}); err != ErrNotFound {

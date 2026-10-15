@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
-	"fmt"
 	"io"
 	"os"
 	"os/signal"
@@ -36,12 +35,21 @@ func execute(ctx context.Context, args []string, out, stderr io.Writer) int {
 			code, kind = 2, "not_found"
 		case errors.Is(err, imdb.ErrAmbiguous):
 			code, kind = 3, "ambiguous"
-		case errors.Is(err, imdb.ErrInvalidQuery):
+		case errors.Is(err, imdb.ErrInvalidInput):
 			code, kind = 4, "invalid_input"
 		case errors.Is(err, imdb.ErrSchema):
 			code, kind = 5, "schema"
 		}
-		_ = json.NewEncoder(stderr).Encode(map[string]string{"kind": kind, "error": err.Error()})
+		var ambiguity *imdb.AmbiguousError
+		var validation *imdb.ValidationError
+		_ = errors.As(err, &ambiguity)
+		_ = errors.As(err, &validation)
+		_ = json.NewEncoder(stderr).Encode(struct {
+			Kind       string                `json:"kind"`
+			Error      string                `json:"error"`
+			Ambiguity  *imdb.AmbiguousError  `json:"ambiguity,omitempty"`
+			Validation *imdb.ValidationError `json:"validation,omitempty"`
+		}{Kind: kind, Error: err.Error(), Ambiguity: ambiguity, Validation: validation})
 		return code
 	}
 	return 0
@@ -49,11 +57,11 @@ func execute(ctx context.Context, args []string, out, stderr io.Writer) int {
 
 func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 	if len(args) == 0 {
-		return fmt.Errorf("%w: usage: imdb update|query|info [flags]", imdb.ErrInvalidQuery)
+		return &imdb.ValidationError{Field: "command", Problem: "usage: imdb update|query|info [flags]"}
 	}
 	command := args[0]
 	if command != "update" && command != "query" && command != "info" {
-		return fmt.Errorf("%w: unknown command %q", imdb.ErrInvalidQuery, command)
+		return &imdb.ValidationError{Field: "command", Problem: "must be update, query, or info"}
 	}
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
@@ -69,33 +77,39 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 		if err := parseFlags(flags, args[1:], out); err != nil {
 			return err
 		}
-		if flags.NArg() != 0 || (*dir != "" && *base != "") || *timeout <= 0 {
-			return imdb.ErrInvalidQuery
+		if flags.NArg() != 0 {
+			return &imdb.ValidationError{Field: "arguments", Problem: "positional arguments are not supported"}
+		}
+		if *dir != "" && *base != "" {
+			return &imdb.ValidationError{Field: "input-dir", Problem: "cannot be combined with base-url"}
+		}
+		if *timeout <= 0 {
+			return &imdb.ValidationError{Field: "timeout", Problem: "must be positive"}
 		}
 		if *progressMode != "auto" && *progressMode != "always" && *progressMode != "never" {
-			return fmt.Errorf("%w: progress must be auto, always, or never", imdb.ErrInvalidQuery)
+			return &imdb.ValidationError{Field: "progress", Problem: "must be auto, always, or never"}
 		}
 		var source imdb.Source = imdb.HTTPSource{BaseURL: *base}
 		if *dir != "" {
-			source = imdb.SourceFunc(func(ctx context.Context, d imdb.Dataset) (io.ReadCloser, imdb.SourceInfo, error) {
+			source = imdb.SourceFunc(func(ctx context.Context, d imdb.Dataset) (io.ReadCloser, imdb.SourceMetadata, error) {
 				if err := ctx.Err(); err != nil {
-					return nil, imdb.SourceInfo{}, err
+					return nil, imdb.SourceMetadata{}, err
 				}
 				filename := filepath.Join(*dir, string(d))
 				f, err := os.Open(filename)
 				if err != nil {
-					return nil, imdb.SourceInfo{}, err
+					return nil, imdb.SourceMetadata{}, err
 				}
 				stat, err := f.Stat()
 				if err != nil {
 					_ = f.Close()
-					return nil, imdb.SourceInfo{}, err
+					return nil, imdb.SourceMetadata{}, err
 				}
 				var size int64
 				if stat.Mode().IsRegular() {
 					size = stat.Size()
 				}
-				return f, imdb.SourceInfo{URL: filename, SizeBytes: size}, nil
+				return f, imdb.SourceMetadata{URL: filename, SizeBytes: size}, nil
 			})
 		}
 		updateCtx, cancel := context.WithTimeout(ctx, *timeout)
@@ -123,14 +137,14 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 			return err
 		}
 		if flags.NArg() != 0 {
-			return imdb.ErrInvalidQuery
+			return &imdb.ValidationError{Field: "arguments", Problem: "positional arguments are not supported"}
 		}
 		c, err := imdb.Open(ctx, *path)
 		if err != nil {
 			return err
 		}
 		defer func() { _ = c.Close() }()
-		q := imdb.Query{Title: *title, Kind: imdb.Kind(*kind), Year: *year, ExcludeAdult: *excludeAdult}
+		q := imdb.Query{Title: *title, Kind: imdb.Kind(*kind), StartYear: *year, ExcludeAdult: *excludeAdult}
 		if *candidates {
 			r, err := c.Candidates(ctx, q, imdb.SearchOptions{Limit: *limit})
 			if err != nil {
@@ -149,7 +163,7 @@ func run(ctx context.Context, args []string, out, stderr io.Writer) error {
 			return err
 		}
 		if flags.NArg() != 0 {
-			return imdb.ErrInvalidQuery
+			return &imdb.ValidationError{Field: "arguments", Problem: "positional arguments are not supported"}
 		}
 		c, err := imdb.Open(ctx, *path)
 		if err != nil {
@@ -178,7 +192,7 @@ func parseFlags(flags *flag.FlagSet, args []string, out io.Writer) error {
 		return errHelp
 	}
 	if err != nil {
-		return fmt.Errorf("%w: %w", imdb.ErrInvalidQuery, err)
+		return &imdb.ValidationError{Field: "flags", Problem: err.Error()}
 	}
 	return nil
 }

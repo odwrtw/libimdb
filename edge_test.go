@@ -31,7 +31,7 @@ func TestNormalizedAliasCollision(t *testing.T) {
 	if _, err := c.Resolve(context.Background(), Query{Title: "The Matrix"}); !errors.Is(err, ErrAmbiguous) {
 		t.Fatalf("primary name overrode alias collision: %v", err)
 	}
-	m, err := c.Resolve(context.Background(), Query{Title: "The Matrix", Year: 1999})
+	m, err := c.Resolve(context.Background(), Query{Title: "The Matrix", StartYear: 1999})
 	if err != nil || m.Title.ID != "tt1" {
 		t.Fatalf("%+v %v", m, err)
 	}
@@ -52,13 +52,13 @@ func TestBusyWriter(t *testing.T) {
 	defer cancel()
 	base := fixtureSource(t, fixtures())
 	blocked, release := make(chan struct{}), make(chan struct{})
-	source := SourceFunc(func(ctx context.Context, d Dataset) (io.ReadCloser, SourceInfo, error) {
+	source := SourceFunc(func(ctx context.Context, d Dataset) (io.ReadCloser, SourceMetadata, error) {
 		if d == Ratings {
 			close(blocked)
 			select {
 			case <-release:
 			case <-ctx.Done():
-				return nil, SourceInfo{}, ctx.Err()
+				return nil, SourceMetadata{}, ctx.Err()
 			}
 		}
 		return base.Open(ctx, d)
@@ -194,7 +194,7 @@ func TestOptionsAndSources(t *testing.T) {
 			t.Fatal("invalid options accepted")
 		}
 	}
-	for _, base := range []string{"file:///data", "https://example.org/?x=1", ":bad"} {
+	for _, base := range []string{"file:///data", "https://example.org/?x=1", "https://example.org/?", ":bad"} {
 		if _, _, err := (HTTPSource{BaseURL: base}).Open(context.Background(), Basics); err == nil {
 			t.Fatal("invalid base URL accepted")
 		}
@@ -202,8 +202,8 @@ func TestOptionsAndSources(t *testing.T) {
 	if _, _, err := (HTTPSource{}).Open(context.Background(), "bad"); err == nil {
 		t.Fatal("unknown dataset accepted")
 	}
-	if _, err := Update(context.Background(), path, UpdateOptions{Source: SourceFunc(func(context.Context, Dataset) (io.ReadCloser, SourceInfo, error) {
-		return nil, SourceInfo{}, nil
+	if _, err := Update(context.Background(), path, UpdateOptions{Source: SourceFunc(func(context.Context, Dataset) (io.ReadCloser, SourceMetadata, error) {
+		return nil, SourceMetadata{}, nil
 	})}); err == nil {
 		t.Fatal("nil stream accepted")
 	}
@@ -218,7 +218,7 @@ func FuzzNormalization(f *testing.F) {
 			t.Skip()
 		}
 		if !utf8.ValidString(s) {
-			if err := validateQuery(Query{Title: s}); err != ErrInvalidQuery {
+			if err := validateQuery(Query{Title: s}); !errors.Is(err, ErrInvalidInput) {
 				t.Fatalf("invalid UTF-8 accepted: %v", err)
 			}
 			return
@@ -253,7 +253,7 @@ func BenchmarkCatalog(b *testing.B) {
 	defer func() { _ = c.Close() }()
 	b.Run("resolve", func(b *testing.B) {
 		for b.Loop() {
-			if _, err := c.Resolve(ctx, Query{Title: "Synthetic Movie 500", Year: 2000}); err != nil {
+			if _, err := c.Resolve(ctx, Query{Title: "Synthetic Movie 500", StartYear: 2000}); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -281,8 +281,8 @@ func TestChunkedReader(t *testing.T) {
 	for d, text := range fixtures() {
 		files[d] = compressed(t, text)
 	}
-	source := SourceFunc(func(_ context.Context, d Dataset) (io.ReadCloser, SourceInfo, error) {
-		return io.NopCloser(oneByteReader{bytes.NewReader(files[d])}), SourceInfo{}, nil
+	source := SourceFunc(func(_ context.Context, d Dataset) (io.ReadCloser, SourceMetadata, error) {
+		return io.NopCloser(oneByteReader{bytes.NewReader(files[d])}), SourceMetadata{}, nil
 	})
 	if _, err := Update(context.Background(), filepath.Join(t.TempDir(), "chunked.sqlite"), UpdateOptions{Source: source}); err != nil {
 		t.Fatal(err)

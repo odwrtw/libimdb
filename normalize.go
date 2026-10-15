@@ -46,12 +46,27 @@ func grams(s string) []string {
 }
 
 func validateQuery(q Query) error {
-	if !utf8.ValidString(q.Title) || strings.ContainsRune(q.Title, 0) ||
-		len(q.Title) > 1024 || utf8.RuneCountInString(nameKey(q.Title)) > 256 || nameKey(q.Title) == "" || q.Year < 0 ||
-		(q.Kind != "" && q.Kind != Movie && q.Kind != Show) {
-		return ErrInvalidQuery
+	if !utf8.ValidString(q.Title) || strings.ContainsRune(q.Title, 0) {
+		return &ValidationError{Field: "Query.Title", Problem: "must be valid UTF-8 without NUL"}
+	}
+	if len(q.Title) > 1024 {
+		return &ValidationError{Field: "Query.Title", Problem: "must not exceed 1024 bytes"}
+	}
+	key := nameKey(q.Title)
+	if key == "" || utf8.RuneCountInString(key) > 256 {
+		return &ValidationError{Field: "Query.Title", Problem: "must contain 1 to 256 normalized Unicode code points"}
+	}
+	if q.StartYear < 0 {
+		return &ValidationError{Field: "Query.StartYear", Problem: "must not be negative"}
+	}
+	if q.Kind != "" && q.Kind != Movie && q.Kind != Show {
+		return &ValidationError{Field: "Query.Kind", Problem: "must be Movie, Show, or empty"}
 	}
 	return nil
+}
+
+func invalidID(field string) error {
+	return &ValidationError{Field: field, Problem: "must be tt followed by one or more ASCII digits"}
 }
 
 // editDistance is rune-aware and only used on the bounded candidate set.

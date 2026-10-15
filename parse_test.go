@@ -65,10 +65,10 @@ func TestPartialTSVTransferError(t *testing.T) {
 					}
 					base := fixtureSource(t, data)
 					opens := 0
-					source := SourceFunc(func(ctx context.Context, d Dataset) (io.ReadCloser, SourceInfo, error) {
+					source := SourceFunc(func(ctx context.Context, d Dataset) (io.ReadCloser, SourceMetadata, error) {
 						if d == tc.dataset {
 							opens++
-							return io.NopCloser(bytes.NewReader(input)), SourceInfo{}, nil
+							return io.NopCloser(bytes.NewReader(input)), SourceMetadata{}, nil
 						}
 						return base.Open(ctx, d)
 					})

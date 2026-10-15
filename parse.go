@@ -181,11 +181,11 @@ func (w *datasetWriter) basics(ctx context.Context, r []string) error {
 	} else {
 		w.counts.Shows++
 	}
-	if err := w.addName(ctx, r[0], Name{Title: r[2], Source: "primary"}); err != nil {
+	if err := w.addName(ctx, r[0], Name{Title: r[2], Source: PrimaryName}); err != nil {
 		return err
 	}
 	if textField(r[3]) != "" && r[3] != r[2] {
-		return w.addName(ctx, r[0], Name{Title: r[3], Source: "original"})
+		return w.addName(ctx, r[0], Name{Title: r[3], Source: OriginalName})
 	}
 	return nil
 }
@@ -202,7 +202,7 @@ func (w *datasetWriter) alias(ctx context.Context, r []string) error {
 	if err != nil {
 		return err
 	}
-	return w.addName(ctx, r[0], Name{Title: r[2], Source: "alias", Region: textField(r[3]), Language: textField(r[4]),
+	return w.addName(ctx, r[0], Name{Title: r[2], Source: AliasName, Region: textField(r[3]), Language: textField(r[4]),
 		Types: listField(r[5], "\x02"), Attributes: listField(r[6], "\x02"), IsOriginal: original})
 }
 

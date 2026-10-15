@@ -49,7 +49,7 @@ func TestRealCatalogSearch(t *testing.T) {
 			}
 		})
 	}
-	match, err := c.Resolve(t.Context(), Query{Title: "The Matrix", Kind: Movie, Year: 1999})
+	match, err := c.Resolve(t.Context(), Query{Title: "The Matrix", Kind: Movie, StartYear: 1999})
 	if err != nil || match.Title.ID != "tt0133093" {
 		t.Fatalf("safe real-data resolution: %+v %v", match, err)
 	}

@@ -66,15 +66,15 @@ func fixtureSource(t testing.TB, data map[Dataset]string) Source {
 	for d, text := range data {
 		files[d] = compressed(t, text)
 	}
-	return SourceFunc(func(ctx context.Context, d Dataset) (io.ReadCloser, SourceInfo, error) {
+	return SourceFunc(func(ctx context.Context, d Dataset) (io.ReadCloser, SourceMetadata, error) {
 		if err := ctx.Err(); err != nil {
-			return nil, SourceInfo{}, err
+			return nil, SourceMetadata{}, err
 		}
 		b, ok := files[d]
 		if !ok {
-			return nil, SourceInfo{}, fmt.Errorf("missing fixture %s", d)
+			return nil, SourceMetadata{}, fmt.Errorf("missing fixture %s", d)
 		}
-		return io.NopCloser(bytes.NewReader(b)), SourceInfo{URL: "fixture:" + string(d)}, nil
+		return io.NopCloser(bytes.NewReader(b)), SourceMetadata{URL: "fixture:" + string(d)}, nil
 	})
 }
 
@@ -115,7 +115,7 @@ func TestCatalogFacts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m.PrimaryTitle != "The Matrix" || *m.Year != 1999 || *m.Runtime != 136 ||
+	if m.PrimaryTitle != "The Matrix" || *m.StartYear != 1999 || *m.RuntimeMinutes != 136 ||
 		*m.Adult || *m.Rating != 8.7 || *m.Votes != 2100000 || strings.Join(m.Genres, ",") != "Action,Sci-Fi" {
 		t.Fatalf("facts: %+v", m)
 	}
@@ -123,7 +123,7 @@ func TestCatalogFacts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if null.Year != nil || null.EndYear != nil || null.Runtime != nil || null.Adult != nil || null.Genres != nil || null.Rating != nil || null.Votes != nil {
+	if null.StartYear != nil || null.EndYear != nil || null.RuntimeMinutes != nil || null.Adult != nil || null.Genres != nil || null.Rating != nil || null.Votes != nil {
 		t.Fatalf("nulls: %+v", null)
 	}
 	for _, id := range []string{"tt8", "tt9", "tt999"} {
@@ -150,30 +150,30 @@ func TestResolve(t *testing.T) {
 		name   string
 		q      Query
 		id     string
-		method Method
+		method MatchMethod
 		err    error
 	}{
 		{"exact", Query{Title: "The Matrix"}, "tt1", Exact, nil},
-		{"fold", Query{Title: "  THE\tMATRIX  ", Kind: Movie, Year: 1999}, "tt1", Normalized, nil},
+		{"fold", Query{Title: "  THE\tMATRIX  ", Kind: Movie, StartYear: 1999}, "tt1", Normalized, nil},
 		{"unicode", Query{Title: "AMÉLIE"}, "tt5", Normalized, nil},
 		{"combining", Query{Title: "Ame\u0301lie"}, "tt5", Normalized, nil},
 		{"original", Query{Title: "Le Fabuleux Destin d'Amélie Poulain"}, "tt5", Exact, nil},
 		{"alias duplicates", Query{Title: "La Matrice"}, "tt1", Exact, nil},
-		{"remake", Query{Title: "Dune", Kind: Movie, Year: 2021}, "tt3", Exact, nil},
+		{"remake", Query{Title: "Dune", Kind: Movie, StartYear: 2021}, "tt3", Exact, nil},
 		{"series", Query{Title: "Dune", Kind: Show}, "tt4", Exact, nil},
 		{"unknown year", Query{Title: "Unknown Year"}, "tt6", Exact, nil},
 		{"remakes", Query{Title: "Dune", Kind: Movie}, "", "", ErrAmbiguous},
 		{"all kinds", Query{Title: "Dune"}, "", "", ErrAmbiguous},
-		{"same year", Query{Title: "Dark", Kind: Movie, Year: 2015}, "", "", ErrAmbiguous},
-		{"year constraint", Query{Title: "The Matrix", Year: 2000}, "", "", ErrNotFound},
-		{"null year constraint", Query{Title: "Unknown Year", Year: 2000}, "", "", ErrNotFound},
+		{"same year", Query{Title: "Dark", Kind: Movie, StartYear: 2015}, "", "", ErrAmbiguous},
+		{"year constraint", Query{Title: "The Matrix", StartYear: 2000}, "", "", ErrNotFound},
+		{"null year constraint", Query{Title: "Unknown Year", StartYear: 2000}, "", "", ErrNotFound},
 		{"typo", Query{Title: "The Matrx"}, "", "", ErrNotFound},
 		{"prefix", Query{Title: "The Mat"}, "", "", ErrNotFound},
 		{"adult excluded", Query{Title: "Adult Film", ExcludeAdult: true}, "", "", ErrNotFound},
 		{"adult included", Query{Title: "Adult Film"}, "tt12", Exact, nil},
-		{"invalid", Query{Title: ""}, "", "", ErrInvalidQuery},
-		{"bad kind", Query{Title: "Dune", Kind: "episode"}, "", "", ErrInvalidQuery},
-		{"bad year", Query{Title: "Dune", Year: -1}, "", "", ErrInvalidQuery},
+		{"invalid", Query{Title: ""}, "", "", ErrInvalidInput},
+		{"bad kind", Query{Title: "Dune", Kind: "episode"}, "", "", ErrInvalidInput},
+		{"bad year", Query{Title: "Dune", StartYear: -1}, "", "", ErrInvalidInput},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -189,7 +189,7 @@ func TestCandidates(t *testing.T) {
 	_, c, info := newCatalog(t)
 	for _, tc := range []struct {
 		key, id string
-		method  Method
+		method  MatchMethod
 	}{
 		{"The Matrix", "tt1", Exact}, {"THE MATRIX", "tt1", Normalized},
 		{"The Mat", "tt1", Prefix}, {"The Matrx", "tt1", Fuzzy},
@@ -211,17 +211,17 @@ func TestCandidates(t *testing.T) {
 		t.Fatalf("dedup: %+v %v", got, err)
 	}
 	got, err = c.Candidates(context.Background(), Query{Title: "Dune", Kind: Movie}, SearchOptions{Limit: 1})
-	if err != nil || len(got.Matches) != 1 || !got.Truncated {
+	if err != nil || len(got.Matches) != 1 || !got.LimitTruncated || got.BudgetExhausted {
 		t.Fatalf("limit: %+v %v", got, err)
 	}
 	if _, err := c.Resolve(context.Background(), Query{Title: "Dune", Kind: Movie}); !errors.Is(err, ErrAmbiguous) {
 		t.Fatal(err)
 	}
 	got, err = c.Candidates(context.Background(), Query{Title: "Dune"}, SearchOptions{Budget: 1})
-	if err != nil || !got.Truncated {
+	if err != nil || !got.BudgetExhausted || got.LimitTruncated {
 		t.Fatalf("budget: %+v %v", got, err)
 	}
-	got, err = c.Candidates(context.Background(), Query{Title: "The Matrx", Year: 2000}, SearchOptions{})
+	got, err = c.Candidates(context.Background(), Query{Title: "The Matrx", StartYear: 2000}, SearchOptions{})
 	if err != nil || len(got.Matches) != 0 {
 		t.Fatalf("year: %+v %v", got, err)
 	}
@@ -306,14 +306,14 @@ func TestGzipFailureAndClose(t *testing.T) {
 				files[Ratings] = files[Ratings][:len(files[Ratings])-5]
 			}
 			closes := make(map[Dataset]int)
-			source := SourceFunc(func(_ context.Context, d Dataset) (io.ReadCloser, SourceInfo, error) {
+			source := SourceFunc(func(_ context.Context, d Dataset) (io.ReadCloser, SourceMetadata, error) {
 				return &closeReader{Reader: bytes.NewReader(files[d]), close: func() error {
 					closes[d]++
 					if mode == "close" && d == Ratings {
 						return errors.New("close failure")
 					}
 					return nil
-				}}, SourceInfo{}, nil
+				}}, SourceMetadata{}, nil
 			})
 			if _, err := Update(context.Background(), path, UpdateOptions{Source: source}); err == nil {
 				t.Fatal("unexpected success")
@@ -397,13 +397,13 @@ func TestReadersDuringUpdate(t *testing.T) {
 	path, c, old := newCatalog(t)
 	base := fixtureSource(t, fixtures())
 	atRatings, release := make(chan struct{}), make(chan struct{})
-	source := SourceFunc(func(ctx context.Context, d Dataset) (io.ReadCloser, SourceInfo, error) {
+	source := SourceFunc(func(ctx context.Context, d Dataset) (io.ReadCloser, SourceMetadata, error) {
 		if d == Ratings {
 			close(atRatings)
 			select {
 			case <-release:
 			case <-ctx.Done():
-				return nil, SourceInfo{}, ctx.Err()
+				return nil, SourceMetadata{}, ctx.Err()
 			}
 		}
 		return base.Open(ctx, d)
@@ -445,7 +445,7 @@ func TestCancellation(t *testing.T) {
 	path, c, old := newCatalog(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	base := fixtureSource(t, fixtures())
-	source := SourceFunc(func(ctx context.Context, d Dataset) (io.ReadCloser, SourceInfo, error) {
+	source := SourceFunc(func(ctx context.Context, d Dataset) (io.ReadCloser, SourceMetadata, error) {
 		if d == Ratings {
 			cancel()
 		}
@@ -535,17 +535,17 @@ func TestSQLInjectionAndLimits(t *testing.T) {
 		}
 	}
 	for _, q := range []Query{{Title: "\xff"}, {Title: "a\x00b"}, {Title: strings.Repeat("x", 257)}} {
-		if _, err := c.Resolve(context.Background(), q); !errors.Is(err, ErrInvalidQuery) {
+		if _, err := c.Resolve(context.Background(), q); !errors.Is(err, ErrInvalidInput) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := c.Candidates(context.Background(), Query{Title: "Dune"}, SearchOptions{Budget: 10001}); !errors.Is(err, ErrInvalidQuery) {
+	if _, err := c.Candidates(context.Background(), Query{Title: "Dune"}, SearchOptions{Budget: 10001}); !errors.Is(err, ErrInvalidInput) {
 		t.Fatal(err)
 	}
-	if _, err := c.Lookup(context.Background(), "invalid"); !errors.Is(err, ErrInvalidQuery) {
+	if _, err := c.Lookup(context.Background(), "invalid"); !errors.Is(err, ErrInvalidInput) {
 		t.Fatal(err)
 	}
-	if _, err := c.LookupMany(context.Background(), []string{"bad"}); !errors.Is(err, ErrInvalidQuery) {
+	if _, err := c.LookupMany(context.Background(), []string{"bad"}); !errors.Is(err, ErrInvalidInput) {
 		t.Fatal(err)
 	}
 	if _, err := c.Names(context.Background(), "tt999"); !errors.Is(err, ErrNotFound) {
@@ -555,7 +555,7 @@ func TestSQLInjectionAndLimits(t *testing.T) {
 
 func TestResolveUsesNameIndex(t *testing.T) {
 	_, c, _ := newCatalog(t)
-	query, args := resolveIDsQuery(Query{Title: "Dune", Kind: Movie, Year: 2021, ExcludeAdult: true})
+	query, args := resolveIDsQuery(Query{Title: "Dune", Kind: Movie, StartYear: 2021, ExcludeAdult: true})
 	rows, err := c.db.Query("EXPLAIN QUERY PLAN "+query, args...)
 	if err != nil {
 		t.Fatal(err)

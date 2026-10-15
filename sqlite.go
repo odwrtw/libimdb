@@ -81,7 +81,7 @@ INSERT INTO gram_counts SELECT gram,kind,count(*) FROM search_grams GROUP BY gra
 
 func openDB(ctx context.Context, path string, write bool) (*sql.DB, error) {
 	if path == "" || strings.ContainsRune(path, 0) {
-		return nil, fmt.Errorf("imdb: invalid database path")
+		return nil, &ValidationError{Field: "path", Problem: "must not be empty or contain NUL"}
 	}
 	abs, err := filepath.Abs(path)
 	if err != nil {

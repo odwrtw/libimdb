@@ -15,6 +15,8 @@ import (
 	"unicode/utf8"
 )
 
+// UpdateOptions controls source policy, whole-transaction retries, and reporting.
+// Zero values select the documented defaults. Invalid options return ValidationError.
 type UpdateOptions struct {
 	Source     Source        // nil uses the official HTTPSource
 	Attempts   int           // default 1, maximum 5; retries restart the entire transaction
@@ -45,8 +47,11 @@ func Update(ctx context.Context, path string, opts UpdateOptions) (Info, error) 
 		progress.phase(Failed, err)
 		return Info{}, err
 	}
-	if opts.Attempts < 1 || opts.Attempts > 5 || opts.RetryDelay < 0 {
-		return fail(fmt.Errorf("imdb: invalid update options"))
+	if opts.Attempts < 1 || opts.Attempts > 5 {
+		return fail(&ValidationError{Field: "UpdateOptions.Attempts", Problem: "must be between 1 and 5, or zero for default"})
+	}
+	if opts.RetryDelay < 0 {
+		return fail(&ValidationError{Field: "UpdateOptions.RetryDelay", Problem: "must not be negative"})
 	}
 	if opts.Source == nil {
 		opts.Source = HTTPSource{}
@@ -178,17 +183,17 @@ func updateOnce(ctx context.Context, path string, opts UpdateOptions, progress *
 	return info, nil
 }
 
-func importDataset(ctx context.Context, d Dataset, opts UpdateOptions, w *datasetWriter, progress *progressReporter) (SourceInfo, error) {
+func importDataset(ctx context.Context, d Dataset, opts UpdateOptions, w *datasetWriter, progress *progressReporter) (DatasetReport, error) {
 	progress.opening(d)
 	if err := ctx.Err(); err != nil {
-		return SourceInfo{}, err
+		return DatasetReport{}, err
 	}
 	body, info, err := opts.Source.Open(ctx, d)
 	if err != nil {
-		return SourceInfo{}, err
+		return DatasetReport{}, err
 	}
 	if body == nil {
-		return SourceInfo{}, fmt.Errorf("source returned a nil stream")
+		return DatasetReport{}, fmt.Errorf("source returned a nil stream")
 	}
 	closed, complete := false, false
 	defer func() {
@@ -205,20 +210,19 @@ func importDataset(ctx context.Context, d Dataset, opts UpdateOptions, w *datase
 	reader := io.TeeReader(contextReader{ctx: ctx, reader: body, progress: progress}, hash)
 	rows, err := parseGzip(ctx, d, reader, w, progress)
 	if err != nil {
-		return SourceInfo{}, err
+		return DatasetReport{}, err
 	}
 	// The parser consumes through EOF, including gzip checksum validation.
 	closeErr := body.Close()
 	closed = true
 	if closeErr != nil {
-		return SourceInfo{}, closeErr
+		return DatasetReport{}, closeErr
 	}
-	info.Dataset, info.Rows = d, rows
-	info.SHA256 = hex.EncodeToString(hash.Sum(nil))
+	report := DatasetReport{SourceMetadata: info, Dataset: d, Rows: rows, SHA256: hex.EncodeToString(hash.Sum(nil))}
 	complete = true
 	progress.current.Phase = DatasetDone
 	progress.emit(true)
-	return info, nil
+	return report, nil
 }
 
 type contextReader struct {

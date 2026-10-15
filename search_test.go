@@ -34,8 +34,8 @@ func TestSubstringCandidates(t *testing.T) {
 	for _, tc := range []struct {
 		q      Query
 		id     string
-		method Method
-		source string
+		method MatchMethod
+		source NameSource
 	}{
 		{Query{Title: "matrix", Kind: Movie}, "tt1", Substring, "primary"},
 		{Query{Title: "fabuleux", Kind: Movie}, "tt5", Substring, "original"},
@@ -46,9 +46,9 @@ func TestSubstringCandidates(t *testing.T) {
 		{Query{Title: "It", Kind: Movie}, "tt21", Exact, "primary"},
 		{Query{Title: "...", Kind: Movie}, "tt23", Exact, "primary"},
 		{Query{Title: "matrix", Kind: Show}, "", "", ""},
-		{Query{Title: "matrix", Kind: Movie, Year: 2000}, "", "", ""},
+		{Query{Title: "matrix", Kind: Movie, StartYear: 2000}, "", "", ""},
 	} {
-		t.Run(tc.q.Title+string(tc.q.Kind)+tc.source, func(t *testing.T) {
+		t.Run(tc.q.Title+string(tc.q.Kind)+string(tc.source), func(t *testing.T) {
 			got, err := c.Candidates(context.Background(), tc.q, SearchOptions{Limit: 1})
 			if err != nil {
 				t.Fatal(err)
@@ -62,7 +62,7 @@ func TestSubstringCandidates(t *testing.T) {
 			if len(got.Matches) != 1 || got.Matches[0].Title.ID != tc.id || got.Matches[0].Method != tc.method || got.Matches[0].Name.Source != tc.source {
 				t.Fatalf("unexpected match: %+v", got)
 			}
-			if got.Matches[0].Title.Runtime == nil || got.Matches[0].Title.Genres == nil {
+			if got.Matches[0].Title.RuntimeMinutes == nil || got.Matches[0].Title.Genres == nil {
 				t.Fatalf("metadata not hydrated: %+v", got.Matches[0])
 			}
 			if tc.method == Substring {
@@ -87,8 +87,8 @@ func TestCandidateRankingAndTypoFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantIDs := []string{"tt30", "tt31", "tt32", "tt1"}
-	wantMethods := []Method{Exact, Normalized, Prefix, Substring}
-	if len(got.Matches) != 4 || got.Truncated {
+	wantMethods := []MatchMethod{Exact, Normalized, Prefix, Substring}
+	if len(got.Matches) != 4 || (got.LimitTruncated || got.BudgetExhausted) {
 		t.Fatalf("direct results: %+v", got)
 	}
 	for i, m := range got.Matches {
@@ -115,7 +115,7 @@ func TestCandidateMatchedNameRanking(t *testing.T) {
 		original string
 		aliases  []string
 		want     string
-		method   Method
+		method   MatchMethod
 	}{
 		{"prefix source", "Matrix A", "Matrix A", []string{"Matrix B", "Matrix CC"}, "Matrix B", Prefix},
 		{"prefix raw title", "Unrelated", "Unrelated", []string{"Matrix á", "Matrix Z"}, "Matrix Z", Prefix},
@@ -142,9 +142,9 @@ func TestCandidateMatchedNameRanking(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			var best Match
+			var best Candidate
 			for _, name := range names {
-				m := Match{Title: Title{ID: "tt1"}, Name: name}
+				m := Candidate{Title: Title{ID: "tt1"}, Name: name}
 				if scoreMatch(q, &m, nameKey(name.Title), fuzzyKey(name.Title), nameKey(q.Title), fuzzyKey(q.Title)) &&
 					(best.Method == "" || compareMatches(m, best) < 0) {
 					best = m
@@ -158,7 +158,7 @@ func TestCandidateMatchedNameRanking(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if len(got.Matches) != 1 || got.Truncated {
+				if len(got.Matches) != 1 || (got.LimitTruncated || got.BudgetExhausted) {
 					t.Fatalf("limit %d: %+v", limit, got)
 				}
 				m := got.Matches[0]
@@ -187,11 +187,11 @@ func TestCompactSearchPreservesNamesAndBudget(t *testing.T) {
 		t.Fatalf("lost alias metadata: count=%d err=%v", len(names), err)
 	}
 	got, err := c.Candidates(context.Background(), Query{Title: "The Synthetic Movie 0", Kind: Movie}, SearchOptions{Limit: 1, Budget: 1})
-	if err != nil || len(got.Matches) != 1 || got.Matches[0].Title.ID != "tt1" || got.Truncated {
+	if err != nil || len(got.Matches) != 1 || got.Matches[0].Title.ID != "tt1" || (got.LimitTruncated || got.BudgetExhausted) {
 		t.Fatalf("duplicates consumed budget: %+v %v", got, err)
 	}
-	filtered, err := c.Candidates(context.Background(), Query{Title: "The", Kind: Movie, Year: 1900}, SearchOptions{Budget: 1})
-	if err != nil || len(filtered.Matches) != 0 || !filtered.Truncated {
+	filtered, err := c.Candidates(context.Background(), Query{Title: "The", Kind: Movie, StartYear: 1900}, SearchOptions{Budget: 1})
+	if err != nil || len(filtered.Matches) != 0 || !filtered.BudgetExhausted || filtered.LimitTruncated {
 		t.Fatalf("filtering concealed clipping: %+v %v", filtered, err)
 	}
 }
@@ -205,7 +205,7 @@ func TestCandidateFiltersAndCancellation(t *testing.T) {
 		{Query{Title: "film", Kind: Movie}, 2},
 		{Query{Title: "film", Kind: Movie, ExcludeAdult: true}, 1},
 		{Query{Title: "unknown", Kind: Show, ExcludeAdult: true}, 1},
-		{Query{Title: "unknown", Kind: Show, Year: 2000}, 0},
+		{Query{Title: "unknown", Kind: Show, StartYear: 2000}, 0},
 		{Query{Title: "Dune"}, 3},
 		{Query{Title: "Dune", Kind: Show}, 1},
 	} {
@@ -248,7 +248,7 @@ func TestRepeatedAndMissingGrams(t *testing.T) {
 	data[Basics] += "tt40\tmovie\txaaaaay\txaaaaay\t0\t2000\t\\N\t90\tDrama\n"
 	c := catalogFromData(t, data)
 	got, err := c.Candidates(context.Background(), Query{Title: "aaa", Kind: Movie}, SearchOptions{})
-	if err != nil || len(got.Matches) != 1 || got.Matches[0].Title.ID != "tt40" || got.Matches[0].Method != Substring || got.Truncated {
+	if err != nil || len(got.Matches) != 1 || got.Matches[0].Title.ID != "tt40" || got.Matches[0].Method != Substring || (got.LimitTruncated || got.BudgetExhausted) {
 		t.Fatalf("repeated grams: %+v %v", got, err)
 	}
 	var count int
@@ -256,7 +256,7 @@ func TestRepeatedAndMissingGrams(t *testing.T) {
 		t.Fatalf("repeated gram counted more than once: %d %v", count, err)
 	}
 	missing, err := c.Candidates(context.Background(), Query{Title: "zzz", Kind: Movie}, SearchOptions{})
-	if err != nil || len(missing.Matches) != 0 || missing.Truncated {
+	if err != nil || len(missing.Matches) != 0 || (missing.LimitTruncated || missing.BudgetExhausted) {
 		t.Fatalf("missing gram: %+v %v", missing, err)
 	}
 }

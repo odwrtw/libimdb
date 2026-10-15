@@ -10,7 +10,7 @@ import (
 )
 
 type candidate struct {
-	match  Match // Only identity, ranking and filter fields until final hydration.
+	match  Candidate // Only identity, ranking and filter fields until final hydration.
 	folded string
 	tied   []string // Equally ranked folded names awaiting raw-name tie-breaks.
 }
@@ -21,12 +21,11 @@ type candidateQuery struct {
 	typo  bool
 }
 
-// Candidates returns bounded exact, normalized, prefix and substring suggestions.
-// Substrings require three folded Unicode characters. Whole-title typo search
-// (four or more characters) runs only when direct results do not fill Limit.
-// Retrieval is heuristic; Truncated reports budget/result clipping, not recall.
-// Use Resolve, never candidate rank or count, for authoritative identity.
-func (c *Catalog) Candidates(ctx context.Context, q Query, opts SearchOptions) (SearchResult, error) {
+// Candidates is like Catalog.Candidates, using this view's snapshot.
+func (v *View) Candidates(ctx context.Context, q Query, opts SearchOptions) (SearchResult, error) {
+	if err := v.check(ctx); err != nil {
+		return SearchResult{}, err
+	}
 	if err := validateQuery(q); err != nil {
 		return SearchResult{}, err
 	}
@@ -36,15 +35,15 @@ func (c *Catalog) Candidates(ctx context.Context, q Query, opts SearchOptions) (
 	if opts.Budget == 0 {
 		opts.Budget = 1000
 	}
-	if opts.Limit < 1 || opts.Limit > 100 || opts.Budget < 1 || opts.Budget > 10000 {
-		return SearchResult{}, ErrInvalidQuery
+	if opts.Limit < 1 || opts.Limit > 100 {
+		return SearchResult{}, &ValidationError{Field: "SearchOptions.Limit", Problem: "must be between 1 and 100, or zero for default"}
 	}
-	tx, info, err := c.read(ctx)
-	if err != nil {
-		return SearchResult{}, err
+	if opts.Budget < 1 || opts.Budget > 10000 {
+		return SearchResult{}, &ValidationError{Field: "SearchOptions.Budget", Problem: "must be between 1 and 10000, or zero for default"}
 	}
-	defer func() { _ = tx.Rollback() }()
-	result := SearchResult{Matches: make([]Match, 0), Generation: info.Generation}
+	tx := v.tx
+	var err error
+	result := SearchResult{Matches: make([]Candidate, 0), Generation: v.info.Generation}
 	found := make(map[string]candidate)
 	key, folded := nameKey(q.Title), fuzzyKey(q.Title)
 	run := func(stage candidateQuery, budget int) (int, error) {
@@ -52,7 +51,7 @@ func (c *Catalog) Candidates(ctx context.Context, q Query, opts SearchOptions) (
 		if err != nil {
 			return 0, err
 		}
-		result.Truncated = result.Truncated || clipped
+		result.BudgetExhausted = result.BudgetExhausted || clipped
 		for _, m := range matches {
 			old, exists := found[m.match.Title.ID]
 			rank := compareMatches(m.match, old.match)
@@ -94,7 +93,7 @@ func (c *Catalog) Candidates(ctx context.Context, q Query, opts SearchOptions) (
 		remaining := opts.Budget
 		for _, seed := range seeds[:min(3, len(seeds))] {
 			if remaining == 0 {
-				result.Truncated = true
+				result.BudgetExhausted = true
 				break
 			}
 			inspected, err := run(gramCandidatesQuery(q, key, folded, seed.gram, remaining, true), remaining)
@@ -110,7 +109,7 @@ func (c *Catalog) Candidates(ctx context.Context, q Query, opts SearchOptions) (
 	}
 	slices.SortFunc(ordered, func(a, b candidate) int { return compareMatches(a.match, b.match) })
 	if len(ordered) > opts.Limit {
-		result.Truncated = true
+		result.LimitTruncated = true
 		ordered = ordered[:opts.Limit]
 	}
 	// Decode genres and alias metadata only for the final distinct IMDb IDs.
@@ -206,10 +205,10 @@ func candidateStage(ctx context.Context, tx *sql.Tx, q Query, key, folded string
 		var length int
 		var normalized, exact bool
 		t := &n.match.Title
-		if err := rows.Scan(&t.ID, &t.Kind, &t.Year, &t.Adult, &t.Votes, &n.folded, &length, &normalized, &exact); err != nil {
+		if err := rows.Scan(&t.ID, &t.Kind, &t.StartYear, &t.Adult, &t.Votes, &n.folded, &length, &normalized, &exact); err != nil {
 			return nil, count, false, err
 		}
-		if (q.Kind != "" && q.Kind != t.Kind) || (q.Year != 0 && (t.Year == nil || *t.Year != q.Year)) || (q.ExcludeAdult && t.Adult != nil && *t.Adult) {
+		if (q.Kind != "" && q.Kind != t.Kind) || (q.StartYear != 0 && (t.StartYear == nil || *t.StartYear != q.StartYear)) || (q.ExcludeAdult && t.Adult != nil && *t.Adult) {
 			continue
 		}
 		direct := normalized || strings.HasPrefix(n.folded, folded) || (queryLength >= 3 && strings.Contains(n.folded, folded))
@@ -276,7 +275,7 @@ func candidateGrams(ctx context.Context, tx *sql.Tx, kind Kind, g []string) ([]g
 	return result, rows.Err()
 }
 
-func scoreMatch(q Query, m *Match, key, folded, queryKey, queryFold string) bool {
+func scoreMatch(q Query, m *Candidate, key, folded, queryKey, queryFold string) bool {
 	switch {
 	case key == queryKey:
 		m.Method, m.Score = Normalized, 1
@@ -316,7 +315,7 @@ func abs(n int) int {
 	return n
 }
 
-func methodRank(m Method) int {
+func methodRank(m MatchMethod) int {
 	switch m {
 	case Exact:
 		return 0
@@ -331,7 +330,7 @@ func methodRank(m Method) int {
 	}
 }
 
-func compareMatches(a, b Match) int {
+func compareMatches(a, b Candidate) int {
 	if n := methodRank(a.Method) - methodRank(b.Method); n != 0 {
 		return n
 	}
@@ -358,7 +357,7 @@ func compareMatches(a, b Match) int {
 		return strings.Compare(a.Title.ID, b.Title.ID)
 	}
 	if a.Name.Source != b.Name.Source {
-		return strings.Compare(a.Name.Source, b.Name.Source)
+		return strings.Compare(string(a.Name.Source), string(b.Name.Source))
 	}
 	return strings.Compare(a.Name.Title, b.Name.Title)
 }
