@@ -243,6 +243,121 @@ func TestProgressRetry(t *testing.T) {
 	}
 }
 
+func TestProgressPartialTransferRetry(t *testing.T) {
+	for _, token := range []string{"header", "record"} {
+		for _, mode := range []string{"recover", "exhausted", "cancel"} {
+			t.Run(token+"/"+mode, func(t *testing.T) {
+				path, c, old := newCatalog(t)
+				oldTitle, err := c.Lookup(t.Context(), "tt1")
+				if err != nil {
+					t.Fatal(err)
+				}
+				data := fixtures()
+				data[Basics] = strings.ReplaceAll(data[Basics], "The Matrix", "Updated Matrix")
+				prefix := "titleId\torder"
+				if token == "record" {
+					prefix = headers[Aliases] + "\ntt1\t1\tLa"
+				}
+				partial, complete := interruptedGzip(t, prefix, strings.TrimPrefix(data[Aliases], prefix))
+				files := make(map[Dataset][]byte)
+				for d, text := range data {
+					files[d] = compressed(t, text)
+				}
+				opens, closes := make(map[Dataset]int), make(map[Dataset]int)
+				source := SourceFunc(func(_ context.Context, d Dataset) (io.ReadCloser, SourceInfo, error) {
+					opens[d]++
+					input := files[d]
+					if d == Aliases {
+						input = partial
+						if mode == "recover" && opens[d] == 2 {
+							input = complete
+						}
+					}
+					closed := false
+					return &closeReader{Reader: bytes.NewReader(input), close: func() error {
+						if closed {
+							t.Errorf("%s stream closed more than once", d)
+						}
+						closed = true
+						closes[d]++
+						return nil
+					}}, SourceInfo{}, nil
+				})
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				delay := time.Millisecond
+				if mode == "cancel" {
+					delay = time.Hour // Cancellation must interrupt the retry wait.
+				}
+				var events []Progress
+				info, err := Update(ctx, path, UpdateOptions{Source: source, Attempts: 2, RetryDelay: delay, Progress: func(p Progress) {
+					events = append(events, p)
+					if p.Phase == DatasetDone {
+						if closes[p.Dataset] != opens[p.Dataset] {
+							t.Errorf("completion before stream closure: %+v", p)
+						}
+						if p.Dataset == Aliases && (mode != "recover" || p.Attempt != 2) {
+							t.Errorf("failed dataset reported completion: %+v", p)
+						}
+					}
+					if p.Phase == Retrying {
+						if !errors.Is(p.Err, io.ErrUnexpectedEOF) || p.Attempt != 1 {
+							t.Errorf("lost retry error or wrong attempt: %+v", p)
+						}
+						current, readErr := c.Info(t.Context())
+						if readErr != nil || !reflect.DeepEqual(current, old) {
+							t.Errorf("retry changed committed metadata: %+v %v", current, readErr)
+						}
+						if mode == "cancel" {
+							cancel()
+						}
+					}
+				}})
+				wantAttempts, wantRatings, wantPhase := 2, 0, Failed
+				switch mode {
+				case "recover":
+					wantRatings, wantPhase = 1, Done
+					if err != nil || info.Generation == old.Generation {
+						t.Fatalf("recovery failed: %+v %v", info, err)
+					}
+				case "exhausted":
+					if !errors.Is(err, io.ErrUnexpectedEOF) {
+						t.Fatalf("lost final transfer error: %v", err)
+					}
+				case "cancel":
+					wantAttempts = 1
+					if !errors.Is(err, context.Canceled) {
+						t.Fatalf("lost cancellation: %v", err)
+					}
+				}
+				if opens[Basics] != wantAttempts || opens[Aliases] != wantAttempts || opens[Ratings] != wantRatings || !reflect.DeepEqual(opens, closes) {
+					t.Fatalf("wrong restart/closure counts: opens=%v closes=%v", opens, closes)
+				}
+				phases := make(map[ProgressPhase]int)
+				for _, p := range events {
+					phases[p.Phase]++
+				}
+				last := events[len(events)-1]
+				if phases[Preparing] != wantAttempts || phases[Retrying] != 1 || phases[Done]+phases[Failed] != 1 || last.Phase != wantPhase || last.Attempt != wantAttempts || !errors.Is(last.Err, err) {
+					t.Fatalf("wrong retry lifecycle: %+v", events)
+				}
+				current, readErr := c.Info(t.Context())
+				title, titleErr := c.Lookup(t.Context(), "tt1")
+				if readErr != nil || titleErr != nil {
+					t.Fatalf("read after update: %v %v", readErr, titleErr)
+				}
+				if mode == "recover" {
+					if !reflect.DeepEqual(current, info) || title.PrimaryTitle != "Updated Matrix" {
+						t.Fatalf("committed recovery not visible: %+v %+v", current, title)
+					}
+				} else if !reflect.DeepEqual(current, old) || !reflect.DeepEqual(title, oldTitle) {
+					t.Fatalf("failed refresh changed committed catalog: %+v %+v", current, title)
+				}
+			})
+		}
+	}
+}
+
 func TestProgressFailures(t *testing.T) {
 	for _, mode := range []string{"header", "checksum", "truncated", "close", "permanent", "import cancellation", "commit cancellation", "retry cancellation"} {
 		t.Run(mode, func(t *testing.T) {

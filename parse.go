@@ -34,12 +34,20 @@ func parseGzip(ctx context.Context, d Dataset, input io.Reader, w *datasetWriter
 		}
 		return 0, fmt.Errorf("missing TSV header")
 	}
+	// Scan can return a partial token with a pending read error. Preserve that
+	// error before TSV validation can replace it with a non-retryable error.
+	if err := scanner.Err(); err != nil {
+		return 0, err
+	}
 	if scanner.Text() != headers[d] {
 		return 0, fmt.Errorf("unexpected TSV header")
 	}
 	var rows int64
 	for scanner.Scan() {
 		if err := ctx.Err(); err != nil {
+			return rows, err
+		}
+		if err := scanner.Err(); err != nil {
 			return rows, err
 		}
 		rows++

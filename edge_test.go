@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -124,6 +125,65 @@ func TestHTTPInterruptedBody(t *testing.T) {
 	info, err := c.Info(context.Background())
 	if err != nil || info.Generation != old.Generation {
 		t.Fatalf("%+v %v", info, err)
+	}
+}
+
+func TestHTTPInterruptedBodyRetry(t *testing.T) {
+	path, c, old := newCatalog(t)
+	data := fixtures()
+	data[Basics] = strings.ReplaceAll(data[Basics], "The Matrix", "Updated Matrix")
+	files := make(map[Dataset][]byte)
+	for d, text := range data {
+		files[d] = compressed(t, text)
+	}
+	prefix := headers[Aliases] + "\ntt1\t1\tLa"
+	partial, complete := interruptedGzip(t, prefix, strings.TrimPrefix(data[Aliases], prefix))
+	files[Aliases] = complete
+	var mu sync.Mutex
+	hits := make(map[Dataset]int)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		d := Dataset(strings.TrimPrefix(r.URL.Path, "/"))
+		mu.Lock()
+		hits[d]++
+		attempt := hits[d]
+		mu.Unlock()
+		body := files[d]
+		w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+		if d == Aliases && attempt == 1 {
+			body = partial
+		}
+		if _, err := w.Write(body); err != nil {
+			t.Error(err)
+		}
+	}))
+	defer server.Close()
+	retries := 0
+	info, err := Update(t.Context(), path, UpdateOptions{
+		Source: HTTPSource{BaseURL: server.URL, Client: server.Client()}, Attempts: 2, RetryDelay: time.Millisecond,
+		Progress: func(p Progress) {
+			if p.Phase == Retrying {
+				retries++
+				if !errors.Is(p.Err, io.ErrUnexpectedEOF) {
+					t.Errorf("lost HTTP transfer error: %v", p.Err)
+				}
+			}
+		},
+	})
+	if err != nil || info.Generation == old.Generation || retries != 1 {
+		t.Fatalf("HTTP recovery failed: generation=%s retries=%d err=%v", info.Generation, retries, err)
+	}
+	mu.Lock()
+	if hits[Basics] != 2 || hits[Aliases] != 2 || hits[Ratings] != 1 {
+		t.Errorf("HTTP retry did not restart the whole update: %v", hits)
+	}
+	mu.Unlock()
+	current, err := c.Info(t.Context())
+	if err != nil || current.Generation != info.Generation {
+		t.Fatalf("recovered generation not visible: %+v %v", current, err)
+	}
+	title, err := c.Lookup(t.Context(), "tt1")
+	if err != nil || title.PrimaryTitle != "Updated Matrix" || title.Rating == nil || *title.Rating != 8.7 {
+		t.Fatalf("recovered facts: %+v %v", title, err)
 	}
 }
 
