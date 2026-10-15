@@ -4,6 +4,8 @@ A programmatic, CGO-free Go library for creating and querying a custom SQLite
 catalog from IMDb's public datasets. Module: `github.com/odwrtw/libimdb`;
 package name: `imdb`. Requires Go 1.26.1 or newer.
 
+[Go documentation](https://pkg.go.dev/github.com/odwrtw/libimdb)
+
 ## What it owns
 
 The catalog is authoritative for IMDb identity and available IMDb facts:
@@ -223,6 +225,10 @@ latency guarantee. Existing refreshes reuse SQLite pages and do not automaticall
 shrink the database file, even when search postings become smaller.
 
 ## CLI
+
+[GitHub releases](https://github.com/odwrtw/libimdb/releases) provide a static
+Linux amd64 binary (`imdb-linux-amd64`). Releases are published after checks pass
+on pushes to `master`, with UTC date/time tags and names (`YYYYMMDD-HHMMSS`).
 
 For a daily refresh using the binary built by `./build.sh`, see the
 [systemd user service and timer examples](dist/README.md).
