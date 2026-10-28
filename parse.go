@@ -149,7 +149,8 @@ func (w *datasetWriter) basics(ctx context.Context, r []string) error {
 	if kind == "" {
 		return nil
 	}
-	if textField(r[2]) == "" || nameKey(r[2]) == "" {
+	key := nameKey(r[2])
+	if textField(r[2]) == "" || key == "" {
 		return fmt.Errorf("missing primary title")
 	}
 	adult, err := boolField(r[4])
@@ -181,11 +182,11 @@ func (w *datasetWriter) basics(ctx context.Context, r []string) error {
 	} else {
 		w.counts.Shows++
 	}
-	if err := w.addName(ctx, r[0], Name{Title: r[2], Source: PrimaryName}); err != nil {
+	if err := w.addName(ctx, r[0], key, Name{Title: r[2], Source: PrimaryName}); err != nil {
 		return err
 	}
 	if textField(r[3]) != "" && r[3] != r[2] {
-		return w.addName(ctx, r[0], Name{Title: r[3], Source: OriginalName})
+		return w.addName(ctx, r[0], nameKey(r[3]), Name{Title: r[3], Source: OriginalName})
 	}
 	return nil
 }
@@ -195,14 +196,27 @@ func (w *datasetWriter) alias(ctx context.Context, r []string) error {
 	if err != nil {
 		return err
 	}
-	if ordering == nil || *ordering == 0 || textField(r[2]) == "" || nameKey(r[2]) == "" {
+	key := nameKey(r[2])
+	if ordering == nil || *ordering == 0 || textField(r[2]) == "" || key == "" {
 		return fmt.Errorf("invalid alias")
 	}
 	original, err := boolField(r[7])
 	if err != nil {
 		return err
 	}
-	return w.addName(ctx, r[0], Name{Title: r[2], Source: AliasName, Region: textField(r[3]), Language: textField(r[4]),
+	// IMDb aliases are commonly adjacent by ID, but ordering is not required.
+	// Cache just the last membership check, including excluded IDs. Validate
+	// every row above even when its title will not be retained.
+	if r[0] != w.aliasID {
+		if err := w.exists.QueryRowContext(ctx, r[0]).Scan(&w.aliasRetained); err != nil {
+			return err
+		}
+		w.aliasID = r[0]
+	}
+	if !w.aliasRetained {
+		return nil
+	}
+	return w.addName(ctx, r[0], key, Name{Title: r[2], Source: AliasName, Region: textField(r[3]), Language: textField(r[4]),
 		Types: listField(r[5], "\x02"), Attributes: listField(r[6], "\x02"), IsOriginal: original})
 }
 

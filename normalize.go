@@ -18,8 +18,13 @@ func nameKey(s string) string {
 
 // Lossy keys are used only for candidate suggestions, never for Resolve.
 func fuzzyKey(s string) string {
+	return fuzzyKeyFromNameKey(nameKey(s))
+}
+
+// Reuse safe normalization when the importer already computed it for a name.
+func fuzzyKeyFromNameKey(key string) string {
 	var b strings.Builder
-	for _, r := range norm.NFD.String(nameKey(s)) {
+	for _, r := range norm.NFD.String(key) {
 		switch {
 		case unicode.Is(unicode.Mn, r):
 		case unicode.IsLetter(r) || unicode.IsNumber(r):

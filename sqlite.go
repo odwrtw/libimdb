@@ -71,7 +71,19 @@ CREATE TABLE catalog_info (
 );
 `
 
+// Append postings without maintaining the final primary-key B-tree per name.
+// This is SQLite scratch storage, not a downloaded/extracted dataset file.
+const gramStagingSchema = `
+CREATE TEMP TABLE pending_grams (
+	gram TEXT NOT NULL,
+	kind TEXT NOT NULL,
+	search_id INTEGER NOT NULL
+);
+`
+
 const indexes = `
+INSERT INTO search_grams SELECT gram,kind,search_id FROM temp.pending_grams ORDER BY gram,kind,search_id;
+DROP TABLE temp.pending_grams;
 CREATE INDEX names_by_key ON names(name_key,imdb_id);
 CREATE INDEX names_by_title ON names(imdb_id,fuzzy_key);
 CREATE INDEX search_by_prefix ON search_names(fuzzy_key,id);
@@ -96,6 +108,7 @@ func openDB(ctx context.Context, path string, write bool) (*sql.DB, error) {
 		params.Set("mode", "rwc")
 		params.Set("_txlock", "immediate")
 		params.Add("_pragma", "synchronous(FULL)")
+		params.Add("_pragma", "temp_store(FILE)")
 	}
 	u.RawQuery = params.Encode()
 	db, err := sql.Open("sqlite", u.String())

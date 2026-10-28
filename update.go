@@ -249,18 +249,24 @@ type datasetWriter struct {
 	rating     *sql.Stmt
 	exists     *sql.Stmt
 	counts     Counts
+
+	aliasID       string
+	aliasRetained bool
 }
 
 func newDatasetWriter(ctx context.Context, tx *sql.Tx) (*datasetWriter, error) {
+	if _, err := tx.ExecContext(ctx, gramStagingSchema); err != nil {
+		return nil, err
+	}
 	w := &datasetWriter{}
 	for _, p := range []struct {
 		target **sql.Stmt
 		query  string
 	}{
 		{&w.title, "INSERT INTO titles(imdb_id,kind,title_type,primary_title,original_title,year,end_year,runtime,adult,genres) VALUES(?,?,?,?,?,?,?,?,?,?)"},
-		{&w.name, "INSERT INTO names(imdb_id,title,name_key,fuzzy_key,source,region,language,types,attributes,is_original) SELECT ?,?,?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM titles WHERE imdb_id=?)"},
+		{&w.name, "INSERT INTO names(imdb_id,title,name_key,fuzzy_key,source,region,language,types,attributes,is_original) VALUES(?,?,?,?,?,?,?,?,?,?)"},
 		{&w.searchName, "INSERT INTO search_names(imdb_id,kind,fuzzy_key,rune_length) SELECT imdb_id,kind,?,? FROM titles WHERE imdb_id=? ON CONFLICT(imdb_id,fuzzy_key) DO NOTHING RETURNING id,kind"},
-		{&w.gram, "INSERT INTO search_grams(gram,kind,search_id) SELECT value,?,? FROM json_each(?)"},
+		{&w.gram, "INSERT INTO temp.pending_grams(gram,kind,search_id) SELECT value,?,? FROM json_each(?)"},
 		{&w.rating, "UPDATE titles SET rating=?,votes=? WHERE imdb_id=? AND rating IS NULL"},
 		{&w.exists, "SELECT EXISTS(SELECT 1 FROM titles WHERE imdb_id=?)"},
 	} {
@@ -282,7 +288,8 @@ func (w *datasetWriter) close() {
 	}
 }
 
-func (w *datasetWriter) addName(ctx context.Context, id string, n Name) error {
+// Callers have already checked membership and computed the safe name key.
+func (w *datasetWriter) addName(ctx context.Context, id, key string, n Name) error {
 	types, err := jsonField(n.Types)
 	if err != nil {
 		return err
@@ -291,17 +298,9 @@ func (w *datasetWriter) addName(ctx context.Context, id string, n Name) error {
 	if err != nil {
 		return err
 	}
-	folded := fuzzyKey(n.Title)
-	result, err := w.name.ExecContext(ctx, id, n.Title, nameKey(n.Title), folded, n.Source, n.Region, n.Language, types, attrs, n.IsOriginal, id)
-	if err != nil {
+	folded := fuzzyKeyFromNameKey(key)
+	if _, err := w.name.ExecContext(ctx, id, n.Title, key, folded, n.Source, n.Region, n.Language, types, attrs, n.IsOriginal); err != nil {
 		return err
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if affected == 0 {
-		return nil
 	}
 	w.counts.Names++
 	var searchID int64
